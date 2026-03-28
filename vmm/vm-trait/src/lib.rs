@@ -14,15 +14,15 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-pub mod any;
-pub mod data;
-pub mod descriptor;
-pub mod empty;
-pub mod events;
-pub mod events_ttrpc;
-pub mod fieldpath;
-pub mod sandbox;
-pub mod sandbox_ttrpc;
-pub mod streaming;
-pub mod streaming_ttrpc;
-pub mod timestamp;
+#![deny(unused_imports)]
+
+pub mod hooks;
+pub mod net;
+pub mod vmm;
+
+pub use hooks::{Hooks, NoopHooks, SandboxCtx};
+pub use net::open_tap_fds;
+pub use vmm::{
+    DiskConfig, ExitInfo, HotPlugDevice, HotPlugResult, Pids, VcpuThreads, Vmm, VmmCapabilities,
+    VmmNetworkConfig,
+};

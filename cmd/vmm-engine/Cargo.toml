@@ -1,0 +1,30 @@
+[package]
+name = "vmm-engine-bin"
+version = "0.1.0"
+license = "Apache-2.0"
+edition = "2021"
+
+[[bin]]
+name = "vmm-engine"
+path = "src/main.rs"
+
+[dependencies]
+vmm-engine           = { path = "../../vmm/engine" }
+vmm-adapter-k8s      = { path = "../../vmm/adapter-k8s" }
+vmm-runtime-vmm-task = { path = "../../vmm/runtime-vmm-task" }
+vmm-cloud-hypervisor = { path = "../../vmm/cloud-hypervisor" }
+vmm-qemu             = { path = "../../vmm/qemu" }
+vmm-stratovirt       = { path = "../../vmm/stratovirt" }
+vmm-vm-trait         = { path = "../../vmm/vm-trait" }
+vmm-common           = { path = "../../vmm/common" }
+tokio                = { version = "1", features = ["full"] }
+serde                = { version = "1.0", features = ["derive"] }
+anyhow               = "1.0"
+tracing              = "0.1"
+tracing-subscriber   = { version = "0.3", features = ["env-filter"] }
+clap                 = { version = "4", features = ["derive"] }
+toml                 = "0.5"
+sd-notify            = "0.5.0"
+
+[dev-dependencies]
+tempfile = "3"

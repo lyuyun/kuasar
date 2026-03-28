@@ -14,15 +14,22 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-pub mod any;
-pub mod data;
-pub mod descriptor;
-pub mod empty;
-pub mod events;
-pub mod events_ttrpc;
-pub mod fieldpath;
-pub mod sandbox;
-pub mod sandbox_ttrpc;
-pub mod streaming;
-pub mod streaming_ttrpc;
-pub mod timestamp;
+use serde::Deserialize;
+
+/// Runtime-level configuration for `SandboxEngine`.
+#[derive(Deserialize, Clone)]
+pub struct EngineConfig {
+    /// Directory where per-sandbox state directories are created.
+    pub work_dir: String,
+    /// How long (milliseconds) to wait for the guest ttrpc endpoint to become ready.
+    pub ready_timeout_ms: u64,
+}
+
+impl Default for EngineConfig {
+    fn default() -> Self {
+        Self {
+            work_dir: "/run/kuasar/engine".to_string(),
+            ready_timeout_ms: 45_000,
+        }
+    }
+}

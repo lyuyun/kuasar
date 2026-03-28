@@ -140,9 +140,13 @@ impl CloudHypervisorVM {
         Ok(pid)
     }
 
-    fn append_fd(&mut self, fd: OwnedFd) -> usize {
+    pub fn append_fd(&mut self, fd: OwnedFd) -> usize {
         self.fds.push(fd);
         self.fds.len() - 1 + 3
+    }
+
+    pub fn set_netns(&mut self, netns: &str) {
+        self.netns = netns.to_string();
     }
 
     async fn wait_stop(&mut self, t: Duration) -> Result<()> {

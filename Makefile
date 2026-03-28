@@ -19,12 +19,18 @@ ifeq ($(ENABLE_YOUKI), true)
 	VMM_TASK_FEATURES = youki
 endif
 
-.PHONY: vmm wasm quark clean all install-vmm install-wasm install-quark install-runc install-ctl install \
-        bin/vmm-sandboxer bin/vmm-task bin/vmlinux.bin bin/kuasar.img bin/kuasar.initrd \
+.PHONY: vmm vmm-engine wasm quark clean all install-vmm install-vmm-engine install-wasm install-quark install-runc install-ctl install \
+        bin/vmm-sandboxer bin/vmm-engine bin/vmm-task bin/vmlinux.bin bin/kuasar.img bin/kuasar.initrd \
         bin/wasm-sandboxer bin/quark-sandboxer bin/runc-sandboxer bin/kuasar-ctl \
         test-e2e test-e2e-framework verify-e2e local-up clean-e2e check help
 
 all: vmm quark wasm bin/kuasar-ctl
+
+bin/vmm-engine:
+	@cargo build --release -p vmm-engine-bin
+	@mkdir -p bin && cp target/release/vmm-engine bin/vmm-engine
+
+vmm-engine: bin/vmm-engine
 
 bin/vmm-sandboxer:
 	@cd vmm/sandbox && cargo build --release --bin ${HYPERVISOR} --features=${VMM_SANDBOX_FEATURES}
@@ -75,6 +81,7 @@ endif
 
 clean:
 	@rm -rf bin
+	@cargo clean -p vmm-engine-bin
 	@cd vmm/sandbox && cargo clean
 	@cd vmm/task && cargo clean
 	@cd wasm && cargo clean
@@ -110,6 +117,10 @@ install-quark:
 	@install -p -m 550 bin/quark-sandboxer ${DEST_DIR}${BIN_DIR}/quark-sandboxer
 	@install -d -m 750 ${DEST_DIR}${SYSTEMD_SERVICE_DIR}
 	@install -p -m 640 quark/service/kuasar-quark.service ${DEST_DIR}${SYSTEMD_SERVICE_DIR}/kuasar-quark.service
+
+install-vmm-engine:
+	@install -d -m 750 ${DEST_DIR}${BIN_DIR}
+	@install -p -m 550 bin/vmm-engine ${DEST_DIR}${BIN_DIR}/vmm-engine
 
 install-runc:
 	@install -p -m 550 bin/runc-sandboxer ${DEST_DIR}${BIN_DIR}/runc-sandboxer
@@ -164,6 +175,8 @@ help: ## Display this help screen
 	@echo ""
 	@echo "Available targets:"
 	@awk 'BEGIN {FS = ":.*##"} /^[a-zA-Z0-9_-]+:.*##/ { printf "  %-20s %s\n", $$1, $$2 }' $(MAKEFILE_LIST)
+	@echo ""
+	@echo "  vmm-engine       Build the new unified VMM engine binary (cmd/vmm-engine)"
 	@echo ""
 	@echo "Variables:"
 	@echo "  HYPERVISOR       Hypervisor to use (default: cloud_hypervisor)"

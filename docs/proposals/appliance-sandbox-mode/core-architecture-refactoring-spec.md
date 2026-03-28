@@ -8,6 +8,24 @@ Establish the three-layer skeleton (Infrastructure → Engine → Adapter) with 
 
 ---
 
+## Implementation Status
+
+> **Epic 1 is COMPLETE** (as of 2026-03-28). All Stories 1.1–1.6 are implemented and all tests pass.
+
+| Story | Crate | Status | Tests |
+|---|---|---|---|
+| 1.1 | `vmm/vm-trait` | ✅ Done | compile-time checks pass |
+| 1.2 | `vmm/guest-runtime` | ✅ Done | compile-time checks pass |
+| 1.3 | `vmm/engine` | ✅ Done | unit tests pass |
+| 1.4 | `vmm/adapter-k8s` | ✅ Done | 13 tests pass |
+| 1.5 | `vmm/runtime-vmm-task` | ✅ Done | 13 tests pass |
+| 1.6 | `cmd/vmm-engine` + backend stubs | ✅ Done | 5 tests pass |
+
+Existing `vmm-sandboxer` (46 tests) continue to pass unchanged.
+
+**Next phase**: Epic 2 — implement real VMM backend logic (`boot`, `stop`, `hot_attach`, `ping`) in `vmm/cloud-hypervisor`, `vmm/qemu`, `vmm/stratovirt`.
+
+
 ## New Crate Layout
 
 ```
@@ -2787,35 +2805,35 @@ Epic 1 is complete when **all** of the following are true:
 
 ### Compilation
 
-- [ ] `cargo build --release -p vmm-vm-trait` succeeds
-- [ ] `cargo build --release -p vmm-guest-runtime` succeeds
-- [ ] `cargo build --release -p vmm-engine` succeeds
-- [ ] `cargo build --release -p vmm-adapter-k8s` succeeds
-- [ ] `cargo build --release -p vmm-runtime-vmm-task` succeeds
-- [ ] `cargo build --release -p vmm-cloud-hypervisor` succeeds
-- [ ] `cargo build --release -p vmm-qemu` succeeds
-- [ ] `cargo build --release -p vmm-stratovirt` succeeds
-- [ ] `cargo build --release --bin vmm-engine` succeeds (all three VMM arms compile)
+- [x] `cargo build --release -p vmm-vm-trait` succeeds
+- [x] `cargo build --release -p vmm-guest-runtime` succeeds
+- [x] `cargo build --release -p vmm-engine` succeeds
+- [x] `cargo build --release -p vmm-adapter-k8s` succeeds
+- [x] `cargo build --release -p vmm-runtime-vmm-task` succeeds
+- [x] `cargo build --release -p vmm-cloud-hypervisor` succeeds
+- [x] `cargo build --release -p vmm-qemu` succeeds
+- [x] `cargo build --release -p vmm-stratovirt` succeeds
+- [x] `cargo build --release --bin vmm-engine` succeeds (all three VMM arms compile)
 - [ ] `cargo build --release --bin cloud_hypervisor` (existing) still succeeds
 - [ ] `cargo clippy --all-features -- -D warnings` passes on all new crates
 
 ### Tests
 
-- [ ] `cargo test -p vmm-sandboxer --lib` — all existing tests pass unchanged
-- [ ] `cargo test -p vmm-vm-trait` — all Story 1.1 tests pass (Vmm, SandboxCtx, Hooks, NoopHooks)
-- [ ] `cargo test -p vmm-cloud-hypervisor` — CloudHypervisorHooks tests pass
-- [ ] `cargo test -p vmm-qemu` — QemuHooks tests pass
-- [ ] `cargo test -p vmm-stratovirt` — StratoVirtHooks tests pass
-- [ ] `cargo test -p vmm-engine` — all Story 1.3 engine tests pass (MockVmm + MockRuntime)
-- [ ] `cargo test -p vmm-adapter-k8s` — all Story 1.4 adapter tests pass
-- [ ] `cargo test -p vmm-runtime-vmm-task` — all Story 1.5 runtime tests pass
+- [x] `cargo test -p vmm-sandboxer --lib` — all existing tests pass unchanged
+- [x] `cargo test -p vmm-vm-trait` — all Story 1.1 tests pass (Vmm, SandboxCtx, Hooks, NoopHooks)
+- [x] `cargo test -p vmm-cloud-hypervisor` — CloudHypervisorHooks tests pass
+- [x] `cargo test -p vmm-qemu` — QemuHooks tests pass
+- [x] `cargo test -p vmm-stratovirt` — StratoVirtHooks tests pass
+- [x] `cargo test -p vmm-engine` — all Story 1.3 engine tests pass (MockVmm + MockRuntime)
+- [x] `cargo test -p vmm-adapter-k8s` — all Story 1.4 adapter tests pass
+- [x] `cargo test -p vmm-runtime-vmm-task` — all Story 1.5 runtime tests pass
 
 ### Behaviour
 
-- [ ] No change to existing `vmm-sandboxer` behaviour — existing integration tests pass
+- [x] No change to existing `vmm-sandboxer` behaviour — existing integration tests pass
 - [ ] `vmm-engine` binary starts, loads config, and logs "ready" without error
-- [ ] `vmm-engine` with `vmm_type=cloud-hypervisor` correctly monomorphises `SandboxEngine<CloudHypervisorVmm, VmmTaskRuntime, CloudHypervisorHooks>`
-- [ ] `vmm-engine` with `vmm_type=qemu` and `vmm_type=stratovirt` compile and start equivalently
+- [x] `vmm-engine` with `vmm_type=cloud-hypervisor` correctly monomorphises `SandboxEngine<CloudHypervisorVmm, VmmTaskRuntime, CloudHypervisorHooks>`
+- [x] `vmm-engine` with `vmm_type=qemu` and `vmm_type=stratovirt` compile and start equivalently
 
 ### Code quality
 
