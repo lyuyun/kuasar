@@ -38,14 +38,14 @@ pub mod vhost_user_fs;
 pub mod virtio_net;
 pub mod vsock;
 
-pub(crate) const PCIE_ROOTPORT_CAPACITY: usize = 10;
-pub(crate) const PCIE_ROOTBUS_CAPACITY: usize = 32;
+pub const PCIE_ROOTPORT_CAPACITY: usize = 10;
+pub const PCIE_ROOTBUS_CAPACITY: usize = 32;
 
-pub(crate) const DEFAULT_PCIE_BUS: &str = "pcie.0";
-pub(crate) const DEFAULT_RNG_DEVICE_ID: &str = "rng0";
-pub(crate) const DEFAULT_SERIAL_DEVICE_ID: &str = "virtio-serial0";
-pub(crate) const DEFAULT_CONSOLE_DEVICE_ID: &str = "virtio-console0";
-pub(crate) const DEFAULT_CONSOLE_CHARDEV_ID: &str = "charconsole0";
+pub const DEFAULT_PCIE_BUS: &str = "pcie.0";
+pub const DEFAULT_RNG_DEVICE_ID: &str = "rng0";
+pub const DEFAULT_SERIAL_DEVICE_ID: &str = "virtio-serial0";
+pub const DEFAULT_CONSOLE_DEVICE_ID: &str = "virtio-console0";
+pub const DEFAULT_CONSOLE_CHARDEV_ID: &str = "charconsole0";
 
 pub trait StratoVirtDevice: Device + ToCmdLineParams + SetDeviceAddr {}
 

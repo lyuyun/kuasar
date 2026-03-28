@@ -61,7 +61,7 @@ use crate::{
 };
 
 pub mod config;
-mod devices;
+pub mod devices;
 pub mod factory;
 pub mod hooks;
 mod qmp;
@@ -77,27 +77,27 @@ pub const CONFIG_STRATOVIRT_PATH: &str = "/var/lib/kuasar/config_stratovirt.toml
 // but skip all the fields serialization.
 #[derive(Default, Serialize, Deserialize)]
 pub struct StratoVirtVM {
-    id: String,
-    config: StratoVirtConfig,
+    pub id: String,
+    pub config: StratoVirtConfig,
     #[serde(skip)]
     devices: Vec<Box<dyn StratoVirtDevice + Sync + Send>>,
     #[serde(skip)]
     hot_attached_devices: Vec<Box<dyn StratoVirtHotAttachable + Sync + Send>>,
     #[serde(skip)]
     fds: Vec<OwnedFd>,
-    console_socket: String,
-    agent_socket: String,
-    netns: String,
+    pub console_socket: String,
+    pub agent_socket: String,
+    pub netns: String,
     pids: Pids,
     #[serde(skip)]
-    block_driver: BlockDriver,
+    pub block_driver: BlockDriver,
     #[serde(skip)]
     wait_chan: Option<Receiver<(u32, i128)>>,
     #[serde(skip)]
     client: Option<QmpClient>,
-    virtiofs_daemon: Option<VirtiofsDaemon>,
+    pub virtiofs_daemon: Option<VirtiofsDaemon>,
     #[serde(skip)]
-    pcie_root_bus: Option<PcieRootBus>,
+    pub pcie_root_bus: Option<PcieRootBus>,
     #[serde(skip)]
     pcie_root_ports_pool: Option<PCIERootPorts>,
 }
@@ -332,13 +332,17 @@ impl StratoVirtVM {
         }
     }
 
-    fn attach_device<T: StratoVirtDevice + Sync + Send + 'static>(&mut self, device: T) {
+    pub fn attach_device<T: StratoVirtDevice + Sync + Send + 'static>(&mut self, device: T) {
         self.devices.push(Box::new(device));
     }
 
-    fn append_fd(&mut self, fd: OwnedFd) -> usize {
+    pub fn append_fd(&mut self, fd: OwnedFd) -> usize {
         self.fds.push(fd);
         self.fds.len() - 1 + 3
+    }
+
+    pub fn set_netns(&mut self, netns: &str) {
+        self.netns = netns.to_string();
     }
 
     async fn launch(&mut self) -> Result<Receiver<(u32, i128)>> {
@@ -486,7 +490,7 @@ impl StratoVirtVM {
         ))
     }
 
-    fn attach_to_bus<T: StratoVirtDevice + Sync + Send + 'static>(
+    pub fn attach_to_bus<T: StratoVirtDevice + Sync + Send + 'static>(
         &mut self,
         mut device: T,
     ) -> Result<()> {
@@ -502,7 +506,7 @@ impl StratoVirtVM {
         Ok(())
     }
 
-    fn create_pcie_root_ports(&mut self, cap_size: usize) -> Result<()> {
+    pub fn create_pcie_root_ports(&mut self, cap_size: usize) -> Result<()> {
         let mut root_ports = vec![];
         let first_empty_slot_index = self.get_empty_pcie_slot_index()?;
         if (PCIE_ROOTBUS_CAPACITY - first_empty_slot_index) < cap_size {
@@ -557,7 +561,7 @@ impl StratoVirtVM {
         Err(Error::ResourceExhausted("slot of rootport".to_string()))
     }
 
-    fn create_vitiofs_daemon(&mut self, daemon_path: &str, base_dir: &str, shared_path: &str) {
+    pub fn create_vitiofs_daemon(&mut self, daemon_path: &str, base_dir: &str, shared_path: &str) {
         self.virtiofs_daemon = Some(VirtiofsDaemon {
             path: daemon_path.to_string(),
             log_path: format!("{}/virtiofs.log", base_dir),

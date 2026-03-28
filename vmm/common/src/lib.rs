@@ -17,7 +17,9 @@ limitations under the License.
 pub use containerd_sandbox::data::Io;
 
 pub mod api;
+pub mod cgroup;
 pub mod mount;
+pub mod network;
 pub mod panic;
 pub mod signal;
 pub mod storage;

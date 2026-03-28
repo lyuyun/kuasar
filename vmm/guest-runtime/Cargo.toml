@@ -1,0 +1,13 @@
+[package]
+name = "vmm-guest-runtime"
+version = "0.1.0"
+license = "Apache-2.0"
+edition = "2021"
+
+[dependencies]
+async-trait = "0.1"
+anyhow = "1.0"
+tokio = { version = "1", features = ["sync"] }
+ipnetwork = "0.20"
+serde = { version = "1.0", features = ["derive"] }
+containerd-sandbox = { git = "https://github.com/kuasar-io/rust-extensions.git" }

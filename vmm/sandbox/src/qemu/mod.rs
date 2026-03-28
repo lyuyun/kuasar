@@ -64,7 +64,7 @@ use crate::{
 };
 
 pub mod config;
-mod devices;
+pub mod devices;
 pub mod factory;
 pub mod hooks;
 mod qmp_client;
@@ -77,25 +77,25 @@ pub(crate) const QEMU_START_TIMEOUT_IN_SEC: u64 = 10;
 // but skip all the fields serialization.
 #[derive(Default, Serialize, Deserialize)]
 pub struct QemuVM {
-    id: String,
-    config: QemuConfig,
+    pub id: String,
+    pub config: QemuConfig,
     #[serde(skip)]
     devices: Vec<Box<dyn QemuDevice + Sync + Send>>,
     #[serde(skip)]
     hot_attached_devices: Vec<Box<dyn QemuHotAttachable + Sync + Send>>,
     #[serde(skip)]
     fds: Vec<OwnedFd>,
-    console_socket: String,
-    agent_socket: String,
-    netns: String,
+    pub console_socket: String,
+    pub agent_socket: String,
+    pub netns: String,
     pids: Pids,
     #[serde(skip)]
-    block_driver: BlockDriver,
+    pub block_driver: BlockDriver,
     #[serde(skip)]
     wait_chan: Option<Receiver<(u32, i128)>>,
     #[serde(skip)]
     client: Option<QmpClient>,
-    virtiofsd_config: Option<VirtiofsdConfig>,
+    pub virtiofsd_config: Option<VirtiofsdConfig>,
 }
 
 #[async_trait]
@@ -344,13 +344,17 @@ impl QemuVM {
         }
     }
 
-    fn attach_device<T: QemuDevice + Sync + Send + 'static>(&mut self, device: T) {
+    pub fn attach_device<T: QemuDevice + Sync + Send + 'static>(&mut self, device: T) {
         self.devices.push(Box::new(device));
     }
 
-    fn append_fd(&mut self, fd: OwnedFd) -> usize {
+    pub fn append_fd(&mut self, fd: OwnedFd) -> usize {
         self.fds.push(fd);
         self.fds.len() - 1 + 3
+    }
+
+    pub fn set_netns(&mut self, netns: &str) {
+        self.netns = netns.to_string();
     }
 
     async fn launch(&mut self) -> Result<Receiver<(u32, i128)>> {

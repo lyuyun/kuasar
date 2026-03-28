@@ -95,6 +95,12 @@ impl VirtioNetDevice {
 impl_device_no_bus!(VirtioNetDevice);
 impl_set_device_addr!(VirtioNetDevice);
 
+impl Default for VirtioNetDevice {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl VirtioNetDevice {
     pub fn new() -> Self {
         VirtioNetDevice {

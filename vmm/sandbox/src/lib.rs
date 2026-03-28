@@ -16,7 +16,7 @@ limitations under the License.
 #![warn(clippy::expect_fun_call, clippy::expect_used)]
 
 #[macro_use]
-mod device;
+pub mod device;
 
 mod cgroup;
 mod client;
@@ -25,7 +25,7 @@ mod io;
 mod network;
 mod param;
 mod storage;
-mod vm;
+pub mod vm;
 
 pub mod args;
 pub mod cloud_hypervisor;
