@@ -5051,6 +5051,7 @@ dependencies = [
  "containerd-sandbox",
  "libc",
  "serde",
+ "serde_json",
  "tempfile",
  "tokio",
  "tracing",
@@ -5158,6 +5159,7 @@ dependencies = [
  "containerd-sandbox",
  "libc",
  "serde",
+ "serde_json",
  "tokio",
  "tracing",
  "uuid",
@@ -5242,6 +5244,7 @@ dependencies = [
  "containerd-sandbox",
  "libc",
  "serde",
+ "serde_json",
  "tokio",
  "tracing",
  "uuid",
@@ -5310,6 +5313,7 @@ dependencies = [
  "containerd-sandbox",
  "libc",
  "serde",
+ "serde_json",
  "tokio",
 ]
 

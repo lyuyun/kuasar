@@ -76,7 +76,7 @@ impl<V: Vmm, R: GuestReadiness, H: Hooks<V>> SandboxEngine<V, R, H> {
 
     pub async fn create_sandbox(&self, id: &str, req: CreateSandboxRequest) -> Result<()>
     where
-        V: Serialize + DeserializeOwned,
+        V: Serialize + DeserializeOwned + Default,
     {
         // Idempotency guard
         if self.sandboxes.read().await.contains_key(id) {
@@ -150,7 +150,7 @@ impl<V: Vmm, R: GuestReadiness, H: Hooks<V>> SandboxEngine<V, R, H> {
 
     pub async fn start_sandbox(&self, id: &str) -> Result<StartResult>
     where
-        V: Serialize + DeserializeOwned,
+        V: Serialize + DeserializeOwned + Default,
     {
         let instance_mutex = self.get_sandbox(id).await?;
         let t0 = Instant::now();
@@ -349,7 +349,7 @@ impl<V: Vmm, R: GuestReadiness, H: Hooks<V>> SandboxEngine<V, R, H> {
 
     pub async fn stop_sandbox(&self, id: &str, force: bool) -> Result<()>
     where
-        V: Serialize + DeserializeOwned,
+        V: Serialize + DeserializeOwned + Default,
     {
         let instance_mutex = self.get_sandbox(id).await?;
         let mut instance = instance_mutex.lock().await;
@@ -403,7 +403,7 @@ impl<V: Vmm, R: GuestReadiness, H: Hooks<V>> SandboxEngine<V, R, H> {
 
     pub async fn delete_sandbox(&self, id: &str, force: bool) -> Result<()>
     where
-        V: Serialize + DeserializeOwned,
+        V: Serialize + DeserializeOwned + Default,
     {
         let instance_mutex = self.get_sandbox(id).await?;
         {
@@ -469,7 +469,7 @@ impl<V: Vmm, R: GuestReadiness, H: Hooks<V>> SandboxEngine<V, R, H> {
     /// Re-attach engine state from the work directory after process restart.
     pub async fn recover(&self, work_dir: &str)
     where
-        V: Serialize + DeserializeOwned,
+        V: Serialize + DeserializeOwned + Default,
     {
         let mut dir = match tokio::fs::read_dir(work_dir).await {
             Ok(d) => d,

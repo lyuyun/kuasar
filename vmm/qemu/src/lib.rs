@@ -85,6 +85,26 @@ pub struct QemuVmm {
     exit_rx: tokio::sync::watch::Receiver<Option<ExitInfo>>,
 }
 
+impl QemuVmm {
+    fn from_parts(id: String, base_dir: String, vsock_cid: u32, inner: QemuVM) -> Self {
+        let (tx, rx) = tokio::sync::watch::channel(None);
+        Self {
+            id,
+            base_dir,
+            vsock_cid,
+            inner,
+            exit_tx: Arc::new(tx),
+            exit_rx: rx,
+        }
+    }
+}
+
+impl Default for QemuVmm {
+    fn default() -> Self {
+        Self::from_parts(String::new(), String::new(), 0, QemuVM::default())
+    }
+}
+
 impl<'de> Deserialize<'de> for QemuVmm {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         #[derive(Deserialize)]
@@ -513,14 +533,32 @@ impl Vmm for QemuVmm {
             ..Default::default()
         }
     }
+
+    fn from_legacy_vm(vm_json: serde_json::Value, id: &str, base_dir: &str) -> anyhow::Result<Self>
+    where
+        Self: Sized,
+    {
+        // Parse vsock CID from "vsock://CID:1024"; fall back to 0 if absent.
+        let vsock_cid = vm_json["agent_socket"]
+            .as_str()
+            .and_then(parse_vsock_cid)
+            .unwrap_or(0);
+        let inner: QemuVM = serde_json::from_value(vm_json)
+            .map_err(|e| anyhow::anyhow!("deserialize QemuVM: {}", e))?;
+        Ok(Self::from_parts(
+            id.to_string(),
+            base_dir.to_string(),
+            vsock_cid,
+            inner,
+        ))
+    }
 }
 
+/// Parse the vsock CID from an `agent_socket` string of the form `"vsock://CID:port"`.
 fn parse_vsock_cid(agent_socket: &str) -> Option<u32> {
-    // Format: "vsock://CID:1024"
-    agent_socket
-        .strip_prefix("vsock://")
-        .and_then(|s| s.split(':').next())
-        .and_then(|cid| cid.parse().ok())
+    let rest = agent_socket.strip_prefix("vsock://")?;
+    let cid_str = rest.split(':').next()?;
+    cid_str.parse().ok()
 }
 
 // ── QemuHooks ─────────────────────────────────────────────────────────────────
