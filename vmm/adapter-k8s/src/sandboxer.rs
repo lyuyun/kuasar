@@ -74,7 +74,7 @@ pub struct K8sSandboxView<V: Vmm, R: GuestReadiness + ContainerRuntime, H: Hooks
 #[async_trait]
 impl<V, R, H> Sandbox for K8sSandboxView<V, R, H>
 where
-    V: Vmm + Serialize + DeserializeOwned + 'static,
+    V: Vmm + Serialize + DeserializeOwned + Default + 'static,
     R: GuestReadiness + ContainerRuntime + 'static,
     H: Hooks<V> + 'static,
 {
@@ -235,7 +235,7 @@ where
 #[async_trait]
 impl<V, R, H> Sandboxer for K8sAdapter<V, R, H>
 where
-    V: Vmm + Serialize + DeserializeOwned + 'static + Send + Sync,
+    V: Vmm + Serialize + DeserializeOwned + Default + 'static + Send + Sync,
     R: GuestReadiness + ContainerRuntime + 'static,
     H: Hooks<V> + 'static,
 {
@@ -319,7 +319,7 @@ where
 
 impl<V, R, H> K8sAdapter<V, R, H>
 where
-    V: Vmm + Serialize + DeserializeOwned,
+    V: Vmm + Serialize + DeserializeOwned + Default,
     R: GuestReadiness + ContainerRuntime,
     H: Hooks<V>,
 {

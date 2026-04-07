@@ -104,9 +104,13 @@ pub struct ProcessState {
 
 /// Per-sandbox state held in the engine.
 #[derive(Serialize, Deserialize)]
-#[serde(bound = "V: Serialize + for<'de2> Deserialize<'de2>")]
+#[serde(bound = "V: Serialize + for<'de2> Deserialize<'de2> + Default")]
 pub struct SandboxInstance<V: Vmm> {
     pub id: String,
+    /// VMM backend state. Missing in old state files written before this field
+    /// was added; defaults to `V::default()` in that case, causing `recover()`
+    /// to fail gracefully and mark the sandbox as Stopped.
+    #[serde(default)]
     pub vmm: V,
     pub state: SandboxState,
     pub base_dir: String,
@@ -154,7 +158,7 @@ impl<V: Vmm> SandboxInstance<V> {
     }
 }
 
-impl<V: Vmm + Serialize + DeserializeOwned> SandboxInstance<V> {
+impl<V: Vmm + Serialize + DeserializeOwned + Default> SandboxInstance<V> {
     /// Persist sandbox state to `{base_dir}/sandbox.json`.
     pub async fn dump(&self) -> Result<()> {
         let path = format!("{}/sandbox.json", self.base_dir);
@@ -167,12 +171,35 @@ impl<V: Vmm + Serialize + DeserializeOwned> SandboxInstance<V> {
     }
 
     /// Load sandbox state from `{dir}/sandbox.json`.
+    ///
+    /// Tries the current `SandboxInstance` format first.  If that fails and the
+    /// JSON has a `"vm"` key but no `"vmm"` key (legacy `KuasarSandbox` format),
+    /// the migration path in `crate::legacy` is attempted instead.
     pub async fn load(dir: &std::path::Path) -> Result<Self> {
         let file = dir.join("sandbox.json");
         let content = tokio::fs::read_to_string(&file)
             .await
             .map_err(|e| Error::Other(anyhow::anyhow!("read sandbox state {:?}: {}", file, e)))?;
-        serde_json::from_str(&content)
+
+        // Fast path: current format.
+        if let Ok(inst) = serde_json::from_str::<Self>(&content) {
+            return Ok(inst);
+        }
+
+        // Detect legacy KuasarSandbox format (has "vm" but not "vmm").
+        let raw: serde_json::Value = serde_json::from_str(&content)
+            .map_err(|e| Error::Other(anyhow::anyhow!("deserialize sandbox: {}", e)))?;
+        if raw.get("vm").is_some() && raw.get("vmm").is_none() {
+            tracing::info!(
+                "sandbox state {:?} is in legacy KuasarSandbox format; migrating",
+                file
+            );
+            return crate::legacy::migrate::<V>(&raw)
+                .map_err(|e| Error::Other(anyhow::anyhow!("legacy migrate: {}", e)));
+        }
+
+        // Re-run standard deserialization to surface the real error.
+        serde_json::from_str::<Self>(&content)
             .map_err(|e| Error::Other(anyhow::anyhow!("deserialize sandbox: {}", e)))
     }
 }

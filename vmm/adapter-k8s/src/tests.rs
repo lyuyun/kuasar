@@ -64,6 +64,20 @@ struct MockVmm {
     exit_rx: tokio::sync::watch::Receiver<Option<ExitInfo>>,
 }
 
+impl Default for MockVmm {
+    fn default() -> Self {
+        let (tx, rx) = tokio::sync::watch::channel(None);
+        Self {
+            id: String::new(),
+            base_dir: String::new(),
+            vsock_cid: 0,
+            log: Default::default(),
+            exit_tx: Arc::new(tx),
+            exit_rx: rx,
+        }
+    }
+}
+
 impl<'de> Deserialize<'de> for MockVmm {
     fn deserialize<D: Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
         #[derive(Deserialize)]

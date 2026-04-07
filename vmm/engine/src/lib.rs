@@ -18,6 +18,7 @@ pub mod config;
 pub mod engine;
 pub mod error;
 pub mod instance;
+pub mod legacy;
 pub mod state;
 
 #[cfg(test)]

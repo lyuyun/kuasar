@@ -90,6 +90,28 @@ pub struct CloudHypervisorVmm {
     exit_rx: tokio::sync::watch::Receiver<Option<ExitInfo>>,
 }
 
+impl CloudHypervisorVmm {
+    /// Build a `CloudHypervisorVmm` from an already-deserialized `CloudHypervisorVM`.
+    /// Used by both `Default` and `from_legacy_vm`.
+    fn from_inner(id: String, base_dir: String, inner: CloudHypervisorVM) -> Self {
+        let (tx, rx) = tokio::sync::watch::channel(None);
+        Self {
+            id,
+            base_dir,
+            vsock_cid: 0,
+            inner,
+            exit_tx: Arc::new(tx),
+            exit_rx: rx,
+        }
+    }
+}
+
+impl Default for CloudHypervisorVmm {
+    fn default() -> Self {
+        Self::from_inner(String::new(), String::new(), CloudHypervisorVM::default())
+    }
+}
+
 impl<'de> Deserialize<'de> for CloudHypervisorVmm {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         #[derive(Deserialize)]
@@ -373,6 +395,19 @@ impl Vmm for CloudHypervisorVmm {
             virtio_serial: true,
             ..Default::default()
         }
+    }
+
+    fn from_legacy_vm(
+        vm_json: serde_json::Value,
+        id: &str,
+        base_dir: &str,
+    ) -> anyhow::Result<Self>
+    where
+        Self: Sized,
+    {
+        let inner: CloudHypervisorVM = serde_json::from_value(vm_json)
+            .map_err(|e| anyhow::anyhow!("deserialize CloudHypervisorVM: {}", e))?;
+        Ok(Self::from_inner(id.to_string(), base_dir.to_string(), inner))
     }
 }
 

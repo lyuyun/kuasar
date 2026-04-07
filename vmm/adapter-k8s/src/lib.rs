@@ -51,7 +51,7 @@ impl<V: Vmm, R: GuestReadiness + ContainerRuntime, H: Hooks<V>> K8sAdapter<V, R,
     /// recovery logic which loads `{work_dir}/{id}.json` files and pings each VMM.
     pub async fn recover(&self, dir: &str)
     where
-        V: serde::Serialize + serde::de::DeserializeOwned + 'static + Send + Sync,
+        V: serde::Serialize + serde::de::DeserializeOwned + Default + 'static + Send + Sync,
         R: 'static,
         H: 'static,
     {
@@ -61,7 +61,7 @@ impl<V: Vmm, R: GuestReadiness + ContainerRuntime, H: Hooks<V>> K8sAdapter<V, R,
     /// Start serving the containerd Sandbox API on the given socket.
     pub async fn serve(self, listen: &str, dir: &str) -> Result<()>
     where
-        V: serde::Serialize + serde::de::DeserializeOwned + 'static + Send + Sync,
+        V: serde::Serialize + serde::de::DeserializeOwned + Default + 'static + Send + Sync,
         R: 'static,
         H: 'static,
     {

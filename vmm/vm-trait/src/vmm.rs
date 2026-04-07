@@ -19,6 +19,7 @@ use std::collections::HashMap;
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use serde_json::Value as JsonValue;
 
 /// Block device configuration passed before boot/restore.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -272,4 +273,25 @@ pub trait Vmm: Send + Sync + 'static {
     /// Query VMM capabilities. The engine and adapter check these before calling
     /// operations that not all backends support (hot-plug, virtiofs, virtio-serial).
     fn capabilities(&self) -> VmmCapabilities;
+
+    /// Reconstruct a Vmm instance from a legacy `KuasarSandbox` "vm" field JSON.
+    ///
+    /// Called during recovery when the engine finds a `sandbox.json` written by the
+    /// old `vmm-sandboxer` (KuasarSandboxer) in the same working directory.
+    /// `id` and `base_dir` are from the legacy JSON's top-level fields.
+    ///
+    /// The default returns `Err` (migration not supported). Backends override this
+    /// to enable transparent in-place migration from the old sandboxer.
+    fn from_legacy_vm(
+        _vm_json: JsonValue,
+        _id: &str,
+        _base_dir: &str,
+    ) -> anyhow::Result<Self>
+    where
+        Self: Sized,
+    {
+        Err(anyhow::anyhow!(
+            "legacy KuasarSandbox migration not supported for this VMM backend"
+        ))
+    }
 }
