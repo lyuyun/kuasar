@@ -59,6 +59,18 @@ impl SandboxCgroup {
         let sandbox_cgroup_path = format!("{}/{}", cgroup_parent_path, sandbox_id);
         let sandbox_cgroup_rela_path = sandbox_cgroup_path.trim_start_matches('/');
 
+        // On cgroup-v2, cgroups_rs iterates path components with std::fs::create_dir
+        // (not create_dir_all), causing a TOCTOU race when multiple sandboxes are
+        // created concurrently: both see the parent absent, both call mkdir, one gets
+        // EEXIST.  Pre-create the parent using create_dir_all (which is race-safe)
+        // before invoking CgroupBuilder so the parent is guaranteed to exist.
+        if cgroups_rs::hierarchies::is_cgroup2_unified_mode() {
+            let hier = cgroups_rs::hierarchies::auto();
+            let parent_abs = hier.root().join(cgroup_parent_path.trim_start_matches('/'));
+            std::fs::create_dir_all(&parent_abs)
+                .map_err(|e| anyhow!("create cgroup parent {}: {}", parent_abs.display(), e))?;
+        }
+
         let sandbox_cgroup =
             CgroupBuilder::new(sandbox_cgroup_rela_path).build(cgroups_rs::hierarchies::auto())?;
 
