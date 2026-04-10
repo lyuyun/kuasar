@@ -382,6 +382,12 @@ impl<V: Vmm, R: GuestReadiness, H: Hooks<V>> SandboxEngine<V, R, H> {
 
         instance.vmm.stop(force).await.map_err(Error::Other)?;
 
+        // Signal background tasks spawned by forward_events to exit.
+        // monitor_vmm_exit only fires this on unexpected exit; for graceful
+        // stop we must fire it here so the clock-sync and event-forward tasks
+        // are cancelled via their tokio::select! branches.
+        instance.exit_signal.signal();
+
         // post_stop hook
         {
             let mut ctx = instance.make_ctx();

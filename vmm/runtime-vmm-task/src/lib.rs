@@ -241,7 +241,17 @@ impl GuestReadiness for VmmTaskRuntime {
                     loop {
                         tokio::time::sleep(Duration::from_secs(TIME_SYNC_PERIOD)).await;
                         if let Err(e) = do_once_sync_clock(&clock_client, tolerance).await {
+                            let msg = e.to_string();
                             tracing::debug!("sync_clock {}: {:?}", clock_id, e);
+                            // Break on permanent connection failures so the task
+                            // exits even if exit_signal is somehow not fired.
+                            if msg.contains("eof")
+                                || msg.contains("broken pipe")
+                                || msg.contains("Connection reset")
+                                || msg.contains("Connection refused")
+                            {
+                                break;
+                            }
                         }
                     }
                 };
