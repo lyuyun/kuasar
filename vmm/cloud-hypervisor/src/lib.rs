@@ -42,7 +42,7 @@ use vmm_vm_trait::{
 // ── Config ────────────────────────────────────────────────────────────────────
 
 /// Configuration for the Cloud Hypervisor VMM backend.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CloudHypervisorVmmConfig {
     /// Path to the cloud-hypervisor binary.
     pub binary: String,
@@ -68,6 +68,20 @@ fn default_entropy_source() -> String {
 
 fn default_virtiofsd_path() -> String {
     "/usr/local/bin/virtiofsd".to_string()
+}
+
+impl Default for CloudHypervisorVmmConfig {
+    fn default() -> Self {
+        Self {
+            binary: String::new(),
+            vcpus: 0,
+            memory_mb: 0,
+            kernel_path: String::new(),
+            image_path: String::new(),
+            entropy_source: default_entropy_source(),
+            virtiofsd_path: default_virtiofsd_path(),
+        }
+    }
 }
 
 // ── CloudHypervisorVmm ────────────────────────────────────────────────────────

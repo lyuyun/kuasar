@@ -36,6 +36,7 @@ use containerd_shim::protos::{
     },
     shim::shim_ttrpc_async::TaskClient,
 };
+use protobuf::{well_known_types::any::Any, MessageField};
 use serde::Deserialize;
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
@@ -190,7 +191,19 @@ impl GuestReadiness for VmmTaskRuntime {
         let ns = (self.config.ttrpc_timeout_ms as i64).saturating_mul(1_000_000);
         let ctx = with_timeout(ns);
 
+        let config = if let Some(pod_config) = req.sandbox_data.config.as_ref() {
+            let value = serde_json::to_vec(pod_config)
+                .map_err(|e| anyhow!("serialize PodSandboxConfig: {}", e))?;
+            let mut any = Any::new();
+            any.type_url = "PodSandboxConfig".to_string();
+            any.value = value;
+            MessageField::some(any)
+        } else {
+            MessageField::none()
+        };
+
         let sreq = SetupSandboxRequest {
+            config,
             interfaces: req.interfaces.iter().map(interface_to_proto).collect(),
             routes: req.routes.iter().map(route_to_proto).collect(),
             ..Default::default()

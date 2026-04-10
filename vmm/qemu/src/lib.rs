@@ -44,7 +44,7 @@ use vmm_vm_trait::{
 // ── Config ────────────────────────────────────────────────────────────────────
 
 /// Simple QEMU VMM configuration for the engine layer.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QemuVmmConfig {
     pub binary: String,
     pub vcpus: u32,
@@ -64,6 +64,20 @@ fn default_entropy_source() -> String {
 
 fn default_use_vsock() -> bool {
     true
+}
+
+impl Default for QemuVmmConfig {
+    fn default() -> Self {
+        Self {
+            binary: String::new(),
+            vcpus: 0,
+            memory_mb: 0,
+            kernel_path: String::new(),
+            image_path: String::new(),
+            entropy_source: default_entropy_source(),
+            use_vsock: default_use_vsock(),
+        }
+    }
 }
 
 // ── QemuVmm ──────────────────────────────────────────────────────────────────

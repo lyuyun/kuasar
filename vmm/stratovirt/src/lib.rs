@@ -43,7 +43,7 @@ use vmm_vm_trait::{
 // ── Config ────────────────────────────────────────────────────────────────────
 
 /// Simple StratoVirt VMM configuration for the engine layer.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StratoVirtVmmConfig {
     pub binary: String,
     pub vcpus: u32,
@@ -68,6 +68,21 @@ fn default_machine_type() -> String {
 
 fn default_block_driver() -> String {
     "virtio-blk".to_string()
+}
+
+impl Default for StratoVirtVmmConfig {
+    fn default() -> Self {
+        Self {
+            binary: String::new(),
+            vcpus: 0,
+            memory_mb: 0,
+            kernel_path: String::new(),
+            image_path: String::new(),
+            virtiofsd_path: default_virtiofsd_path(),
+            machine_type: default_machine_type(),
+            block_device_driver: default_block_driver(),
+        }
+    }
 }
 
 // ── StratoVirtVmm ─────────────────────────────────────────────────────────────
