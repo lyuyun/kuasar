@@ -85,7 +85,9 @@ where
             .engine
             .get_sandbox_sync(&self.id)
             .map_err(|e| anyhow::anyhow!("{}", e))?;
-        let inst = inst_arc.blocking_lock();
+        let inst = inst_arc
+            .try_lock()
+            .map_err(|_| anyhow::anyhow!("sandbox lock contended"))?;
         Ok(sandbox_state_to_status(&inst.state))
     }
 
@@ -225,7 +227,11 @@ where
             .engine
             .get_sandbox_sync(&self.id)
             .map_err(|e| anyhow::anyhow!("{}", e))?;
-        let data = inst_arc.blocking_lock().data.clone();
+        let data = inst_arc
+            .try_lock()
+            .map_err(|_| anyhow::anyhow!("sandbox lock contended"))?
+            .data
+            .clone();
         Ok(data)
     }
 }

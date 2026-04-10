@@ -442,9 +442,11 @@ impl<V: Vmm, R: GuestReadiness, H: Hooks<V>> SandboxEngine<V, R, H> {
     }
 
     /// Synchronous variant used by non-async contexts (e.g. `Sandbox::status()`).
+    /// Uses `try_read()` to avoid blocking an async executor thread.
     pub fn get_sandbox_sync(&self, id: &str) -> Result<Arc<Mutex<SandboxInstance<V>>>> {
         self.sandboxes
-            .blocking_read()
+            .try_read()
+            .map_err(|_| Error::Other(anyhow::anyhow!("sandboxes lock contended")))?
             .get(id)
             .cloned()
             .ok_or_else(|| Error::NotFound(id.to_string()))
