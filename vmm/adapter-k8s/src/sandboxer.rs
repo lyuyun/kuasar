@@ -23,13 +23,19 @@ use async_trait::async_trait;
 use containerd_sandbox::data::{ContainerData, SandboxData};
 use containerd_sandbox::error::Result as SandboxResult;
 use containerd_sandbox::signal::ExitSignal;
+use containerd_sandbox::spec::{JsonSpec, Mount as SpecMount};
 use containerd_sandbox::{
     Container, ContainerOption, Sandbox, SandboxOption, SandboxStatus, Sandboxer,
 };
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use tokio::sync::Mutex;
-use vmm_common::SHARED_DIR_SUFFIX;
+use vmm_common::storage::{get_fstype, Storage, ANNOTATION_KEY_STORAGE, DRIVERBLKTYPE};
+use vmm_common::{
+    CGROUP_NAMESPACE, DEV_SHM, ETC_HOSTNAME, ETC_HOSTS, ETC_RESOLV, HOSTNAME_FILENAME,
+    HOSTS_FILENAME, IO_FILE_PREFIX, IPC_NAMESPACE, KUASAR_STATE_DIR, NET_NAMESPACE, PID_NAMESPACE,
+    RESOLV_FILENAME, SANDBOX_NS_PATH, SHARED_DIR_SUFFIX, STORAGE_FILE_PREFIX, UTS_NAMESPACE,
+};
 use vmm_engine::instance::{ContainerState, StorageMount, StorageMountKind};
 use vmm_engine::state::SandboxState;
 use vmm_engine::{CreateSandboxRequest, SandboxInstance};
@@ -117,7 +123,14 @@ where
     /// 1. Create bundle directory in the shared virtiofs path.
     /// 2. Process rootfs/bind/block storage mounts (`attach_container_storages`).
     /// 3. Hot-attach IO pipes as `CharDevice` or vsock port (`attach_io_pipes`).
-    /// 4. Persist updated `SandboxInstance` and update the local container cache.
+    /// 4. Transform the OCI spec for the guest environment:
+    ///    - Rewrite mount sources and `spec.root.path` to guest storage paths.
+    ///    - Embed `ANNOTATION_KEY_STORAGE` with block-device descriptors for vmm-task.
+    ///    - Remove host namespaces (NET/CGROUP) and rewrite shared ns paths.
+    ///    - Clear AppArmor profile and host cpuset.
+    ///    - Inject hostname/hosts/resolv.conf bind mounts.
+    /// 5. Write `storage-{id}`, `io-{id}`, and `config.json` into the bundle.
+    /// 6. Persist updated `SandboxInstance` and update the local container cache.
     async fn append_container(&mut self, id: &str, options: ContainerOption) -> SandboxResult<()> {
         let inst_mutex = self
             .engine
@@ -133,7 +146,7 @@ where
             .map_err(|e| anyhow::anyhow!("create bundle dir: {}", e))?;
 
         let mut data = options.container.clone();
-        data.bundle = bundle;
+        data.bundle = bundle.clone();
 
         let mut io_devices: Vec<String> = vec![];
 
@@ -148,6 +161,56 @@ where
                 .await
                 .map_err(|e| anyhow::anyhow!("attach io pipes: {}", e))?;
         }
+
+        // 4. Transform spec and write bundle files
+        if let Some(spec) = data.spec.as_mut() {
+            let shared_path = format!("{}/{}", inst.base_dir, SHARED_DIR_SUFFIX);
+            let rootfs = data.rootfs.clone();
+
+            // 4a. Rewrite spec mounts and root.path to guest paths; collect
+            //     block-device Storage descriptors for vmm-task.
+            let guest_storages = rewrite_spec_mounts_and_root(spec, &rootfs, &inst.storages, id);
+
+            // 4b. Embed storage annotation and write storage-{id} file
+            let storage_str = serde_json::to_string(&guest_storages)
+                .map_err(|e| anyhow::anyhow!("serialize storages: {}", e))?;
+            spec.annotations
+                .insert(ANNOTATION_KEY_STORAGE.to_string(), storage_str.clone());
+            let storage_file = format!("{}/{}-{}", bundle, STORAGE_FILE_PREFIX, id);
+            tokio::fs::write(&storage_file, storage_str.as_bytes())
+                .await
+                .map_err(|e| anyhow::anyhow!("write storage file: {}", e))?;
+
+            // 4c. Namespace transforms
+            apply_namespace_transforms(spec);
+
+            // 4d. Spec cleanup (AppArmor, cpuset)
+            apply_spec_cleanup(spec);
+
+            // 4e. Inject hostname/hosts/resolv.conf mounts from the shared dir
+            add_container_mounts(spec, &shared_path);
+
+            // 4f. Write fully-transformed config.json
+            let spec_str = serde_json::to_string(spec)
+                .map_err(|e| anyhow::anyhow!("serialize spec: {}", e))?;
+            let config_path = format!("{}/config.json", bundle);
+            tokio::fs::write(&config_path, spec_str.as_bytes())
+                .await
+                .map_err(|e| anyhow::anyhow!("write config.json: {}", e))?;
+        }
+
+        // 5. Write io-{id} file with translated chardev/vsock paths
+        if let Some(io) = &data.io {
+            let io_str =
+                serde_json::to_string(io).map_err(|e| anyhow::anyhow!("serialize io: {}", e))?;
+            let io_file = format!("{}/{}-{}", bundle, IO_FILE_PREFIX, id);
+            tokio::fs::write(&io_file, io_str.as_bytes())
+                .await
+                .map_err(|e| anyhow::anyhow!("write io file: {}", e))?;
+        }
+
+        // 6. Clear rootfs — vmm-task handles it via the storage mount_point
+        data.rootfs = vec![];
 
         let container = ContainerState {
             id: id.to_string(),
@@ -407,15 +470,17 @@ async fn attach_container_storages(
                     read_only: m.options.contains(&"ro".to_string()),
                 })
                 .await?;
-            let guest_path = format!("{}{}", KUASAR_GUEST_SHARE_DIR, dev_id);
+            let fstype = get_fstype(&m.source).await.unwrap_or_default();
             inst.storages.push(StorageMount {
                 id: dev_id.clone(),
                 ref_containers: vec![container_id.to_string()],
                 host_path: m.source.clone(),
                 mount_dest: None,
-                guest_path,
+                guest_path: format!("{}{}", KUASAR_GUEST_SHARE_DIR, dev_id),
                 kind: StorageMountKind::Block,
                 device_id: Some(result.device_id),
+                bus_addr: Some(result.bus_addr),
+                fstype,
             });
         } else if is_bind_mount(m) {
             // Dedup: if already bind-mounted for another container, reuse
@@ -433,7 +498,9 @@ async fn attach_container_storages(
             let storage_id = format!("storage{}", inst.id_generator);
             let host_dest = format!("{}/{}/{}", inst.base_dir, SHARED_DIR_SUFFIX, storage_id);
             bind_mount_into_shared(&m.source, &host_dest).await?;
-            let guest_path = format!("{}{}", KUASAR_GUEST_SHARE_DIR, storage_id);
+            // VirtioFs maps {base_dir}/shared/ → /run/kuasar/state/ in the guest,
+            // so the sub-directory is accessible at KUASAR_STATE_DIR/{storage_id}.
+            let guest_path = format!("{}/{}", KUASAR_STATE_DIR, storage_id);
             inst.storages.push(StorageMount {
                 id: storage_id,
                 ref_containers: vec![container_id.to_string()],
@@ -442,6 +509,8 @@ async fn attach_container_storages(
                 guest_path,
                 kind: StorageMountKind::VirtioFs,
                 device_id: None,
+                bus_addr: None,
+                fstype: String::new(),
             });
         }
         // tmpfs, shm, overlay handled by vmm-task; skip on host side
@@ -604,6 +673,154 @@ fn is_bind_mount(m: &containerd_sandbox::spec::Mount) -> bool {
         && m.r#type != "cgroup2"
         && m.r#type != "mqueue"
         && m.r#type != "hugetlbfs"
+}
+
+// ── Spec transform helpers ────────────────────────────────────────────────────
+
+/// Rewrite spec mount sources and `spec.root.path` to point at guest-side paths.
+///
+/// Each mount whose `source` matches a `StorageMount.host_path` is rewritten to
+/// the corresponding `guest_path`.  The rootfs mount (from `data.rootfs`) drives
+/// the `spec.root.path` update.
+///
+/// Returns the list of `Storage` descriptors for block devices that require
+/// guest-side handling by vmm-task (driver `"blk"`).
+fn rewrite_spec_mounts_and_root(
+    spec: &mut JsonSpec,
+    rootfs: &[SpecMount],
+    storages: &[StorageMount],
+    container_id: &str,
+) -> Vec<Storage> {
+    // Rewrite spec mounts whose source matches a StorageMount
+    for m in &mut spec.mounts {
+        if let Some(sm) = storages.iter().find(|s| {
+            s.host_path == m.source && s.ref_containers.contains(&container_id.to_string())
+        }) {
+            m.source = sm.guest_path.clone();
+            // Ensure bind mount option is present for virtiofs-backed mounts
+            if sm.kind == StorageMountKind::VirtioFs && !m.options.contains(&"bind".to_string()) {
+                m.options.push("bind".to_string());
+            }
+        }
+        // Remap host /dev/shm to the guest's own /dev/shm
+        if m.destination == DEV_SHM && m.r#type == "bind" {
+            m.source = DEV_SHM.to_string();
+            if !m.options.contains(&"rbind".to_string()) {
+                m.options.push("rbind".to_string());
+            }
+        }
+    }
+
+    // Set spec.root.path from the rootfs storage guest_path
+    let mut root_source = "rootfs".to_string();
+    for m in rootfs {
+        if let Some(sm) = storages.iter().find(|s| {
+            s.host_path == m.source && s.ref_containers.contains(&container_id.to_string())
+        }) {
+            root_source = sm.guest_path.clone();
+            break;
+        }
+    }
+    if let Some(root) = spec.root.as_mut() {
+        root.path = root_source;
+    }
+
+    // Build Storage list for block devices (need_guest_handle = true)
+    storages
+        .iter()
+        .filter(|s| {
+            s.kind == StorageMountKind::Block
+                && s.ref_containers.contains(&container_id.to_string())
+        })
+        .map(|s| Storage {
+            host_source: s.host_path.clone(),
+            r#type: "bind".to_string(),
+            id: s.id.clone(),
+            device_id: s.device_id.clone(),
+            ref_container: HashMap::new(),
+            need_guest_handle: true,
+            source: s.bus_addr.clone().unwrap_or_default(),
+            driver: DRIVERBLKTYPE.to_string(),
+            driver_options: vec![],
+            fstype: s.fstype.clone(),
+            options: vec![],
+            mount_point: s.guest_path.clone(),
+        })
+        .collect()
+}
+
+/// Remove NET and CGROUP namespaces from the spec; rewrite IPC, UTS, and PID
+/// namespace paths to the shared sandbox namespace paths in `/run/sandbox-ns/`.
+fn apply_namespace_transforms(spec: &mut JsonSpec) {
+    if let Some(linux) = spec.linux.as_mut() {
+        linux
+            .namespaces
+            .retain(|n| n.r#type != NET_NAMESPACE && n.r#type != CGROUP_NAMESPACE);
+
+        for ns in &mut linux.namespaces {
+            ns.path = if ns.r#type == IPC_NAMESPACE
+                || ns.r#type == UTS_NAMESPACE
+                || ns.r#type == PID_NAMESPACE
+            {
+                format!("{}/{}", SANDBOX_NS_PATH, ns.r#type)
+            } else {
+                String::new()
+            };
+        }
+    }
+}
+
+/// Clear AppArmor profile and host cpuset from the spec.
+///
+/// AppArmor profiles from the host are not loaded in the guest OS.
+/// Host cpuset IDs do not map to guest vCPU IDs, so the cpuset must be cleared
+/// to avoid affinity configuration failures inside the VM.
+fn apply_spec_cleanup(spec: &mut JsonSpec) {
+    if let Some(p) = spec.process.as_mut() {
+        p.apparmor_profile = String::new();
+    }
+    if let Some(linux) = spec.linux.as_mut() {
+        if let Some(resources) = linux.resources.as_mut() {
+            if let Some(cpu) = resources.cpu.as_mut() {
+                cpu.cpus = String::new();
+            }
+        }
+    }
+}
+
+/// Inject hostname, hosts, and resolv.conf bind mounts if they are not already
+/// present in the spec and the corresponding files exist in the shared directory.
+///
+/// Sources point to `/run/kuasar/state/{filename}` (guest-side virtiofs path).
+fn add_container_mounts(spec: &mut JsonSpec, shared_path: &str) {
+    let rw = if spec.root.as_ref().map(|r| r.readonly).unwrap_or(false) {
+        "ro"
+    } else {
+        "rw"
+    };
+
+    let candidates = [
+        (ETC_HOSTNAME, HOSTNAME_FILENAME),
+        (ETC_HOSTS, HOSTS_FILENAME),
+        (ETC_RESOLV, RESOLV_FILENAME),
+    ];
+
+    let mut extra: Vec<SpecMount> = vec![];
+    for (dst, filename) in &candidates {
+        if spec.mounts.iter().any(|m| m.destination.as_str() == *dst) {
+            continue;
+        }
+        let host_path = format!("{}/{}", shared_path, filename);
+        if std::path::Path::new(&host_path).exists() {
+            extra.push(SpecMount {
+                destination: dst.to_string(),
+                r#type: "bind".to_string(),
+                source: format!("{}/{}", KUASAR_STATE_DIR, filename),
+                options: vec!["rbind".to_string(), "rprivate".to_string(), rw.to_string()],
+            });
+        }
+    }
+    spec.mounts.append(&mut extra);
 }
 
 /// Bind-mount `source` to `dest` inside the shared virtiofs directory.

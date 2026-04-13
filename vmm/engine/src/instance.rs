@@ -71,6 +71,16 @@ pub struct StorageMount {
     pub kind: StorageMountKind,
     /// If backed by a hot-plugged block device, holds its device_id for hot-detach.
     pub device_id: Option<String>,
+    /// PCI bus address returned by the VMM when hot-plugging the block device.
+    /// Populated for `StorageMountKind::Block`; vmm-task uses this to locate
+    /// the guest kernel device node via its PCI address.
+    #[serde(default)]
+    pub bus_addr: Option<String>,
+    /// Filesystem type of the block device, probed via `blkid` at attach time.
+    /// Populated for `StorageMountKind::Block` and forwarded to vmm-task so it
+    /// can mount the device with the correct filesystem type.
+    #[serde(default)]
+    pub fstype: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

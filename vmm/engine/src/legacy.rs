@@ -179,6 +179,8 @@ fn storage_to_mount(raw: Value) -> anyhow::Result<StorageMount> {
         guest_path: s.source,
         kind,
         device_id: s.device_id,
+        bus_addr: None,
+        fstype: String::new(),
     })
 }
 

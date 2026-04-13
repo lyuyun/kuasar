@@ -14,10 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::collections::HashMap;
+use std::{collections::HashMap, process::Stdio};
 
 use containerd_sandbox::spec::Mount;
 use serde::{Deserialize, Serialize};
+use tokio::process::Command;
 
 pub const ANNOTATION_KEY_STORAGE: &str = "io.kuasar.storages";
 
@@ -44,6 +45,33 @@ pub struct Storage {
     pub fstype: String,
     pub options: Vec<String>,
     pub mount_point: String,
+}
+
+/// Probe the filesystem type of a block device using `blkid`.
+pub async fn get_fstype(path: &str) -> anyhow::Result<String> {
+    let output = Command::new("blkid")
+        .args(["-p", "-s", "TYPE", "-s", "PTTYPE", "-o", "export", path])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to execute blkid: {}", e))?;
+    if !output.status.success() {
+        let error_msg = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow::anyhow!(
+            "blkid failed ({}): {}",
+            output.status,
+            error_msg
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for l in stdout.lines() {
+        let kv: Vec<&str> = l.split('=').collect();
+        if kv.len() == 2 && kv[0] == "TYPE" {
+            return Ok(kv[1].to_string());
+        }
+    }
+    Err(anyhow::anyhow!("failed to get fstype of {}", path))
 }
 
 impl Storage {
