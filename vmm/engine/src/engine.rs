@@ -31,10 +31,11 @@ use vmm_common::{
 use vmm_guest_runtime::{GuestReadiness, NetworkInterface, Route, SandboxSetupRequest};
 use vmm_vm_trait::{ExitInfo, Hooks, Vmm, VmmNetworkConfig};
 
+use containerd_sandbox::SandboxStatus;
+
 use crate::config::EngineConfig;
 use crate::error::{Error, Result};
 use crate::instance::{NetworkState, SandboxInstance, SandboxSummary};
-use crate::state::{SandboxState, StateEvent};
 use crate::{CreateSandboxRequest, StartResult};
 
 type SandboxMap<V> = Arc<RwLock<HashMap<String, Arc<Mutex<SandboxInstance<V>>>>>>;
@@ -118,7 +119,7 @@ impl<V: Vmm, R: GuestReadiness, H: Hooks<V>> SandboxEngine<V, R, H> {
         let mut instance = SandboxInstance {
             id: id.to_string(),
             vmm,
-            state: SandboxState::Creating,
+            status: SandboxStatus::Created,
             base_dir: base_dir.clone(),
             data: req.sandbox_data,
             netns: req.netns,
@@ -157,11 +158,11 @@ impl<V: Vmm, R: GuestReadiness, H: Hooks<V>> SandboxEngine<V, R, H> {
 
         let mut instance = instance_mutex.lock().await;
 
-        // Guard: must be in Creating state
-        if instance.state != SandboxState::Creating {
+        // Guard: must be in Created state
+        if !matches!(instance.status, SandboxStatus::Created) {
             return Err(Error::InvalidState(format!(
-                "sandbox {} must be in Creating state to start, got {:?}",
-                id, instance.state
+                "sandbox {} must be in Created state to start, got {:?}",
+                id, instance.status
             )));
         }
 
@@ -169,7 +170,7 @@ impl<V: Vmm, R: GuestReadiness, H: Hooks<V>> SandboxEngine<V, R, H> {
         {
             let mut ctx = instance.make_ctx();
             if let Err(e) = self.hooks.pre_start(&mut ctx).await {
-                instance.state = SandboxState::Stopped;
+                instance.status = SandboxStatus::Stopped(0, unix_now_nanos());
                 instance.dump().await.ok();
                 return Err(Error::Other(e));
             }
@@ -186,7 +187,7 @@ impl<V: Vmm, R: GuestReadiness, H: Hooks<V>> SandboxEngine<V, R, H> {
                 {
                     Ok(n) => n,
                     Err(e) => {
-                        instance.state = SandboxState::Stopped;
+                        instance.status = SandboxStatus::Stopped(0, unix_now_nanos());
                         instance.dump().await.ok();
                         return Err(Error::Other(e));
                     }
@@ -239,7 +240,7 @@ impl<V: Vmm, R: GuestReadiness, H: Hooks<V>> SandboxEngine<V, R, H> {
         // 3. Boot VMM
         let t_boot = Instant::now();
         if let Err(e) = instance.vmm.boot().await {
-            instance.state = SandboxState::Stopped;
+            instance.status = SandboxStatus::Stopped(0, unix_now_nanos());
             instance.dump().await.ok();
             return Err(Error::Other(e));
         }
@@ -275,14 +276,14 @@ impl<V: Vmm, R: GuestReadiness, H: Hooks<V>> SandboxEngine<V, R, H> {
             Ok(Err(e)) => {
                 let mut inst = instance_mutex.lock().await;
                 inst.vmm.stop(true).await.ok();
-                inst.state = SandboxState::Stopped;
+                inst.status = SandboxStatus::Stopped(0, unix_now_nanos());
                 inst.dump().await.ok();
                 return Err(Error::Other(e));
             }
             Err(_) => {
                 let mut inst = instance_mutex.lock().await;
                 inst.vmm.stop(true).await.ok();
-                inst.state = SandboxState::Stopped;
+                inst.status = SandboxStatus::Stopped(0, unix_now_nanos());
                 inst.dump().await.ok();
                 return Err(Error::Timeout("ready_timeout".into()));
             }
@@ -293,7 +294,7 @@ impl<V: Vmm, R: GuestReadiness, H: Hooks<V>> SandboxEngine<V, R, H> {
             tracing::warn!(sandbox_id = %id, err = %e, "setup_sandbox failed");
             let mut inst = instance_mutex.lock().await;
             inst.vmm.stop(true).await.ok();
-            inst.state = SandboxState::Stopped;
+            inst.status = SandboxStatus::Stopped(0, unix_now_nanos());
             inst.dump().await.ok();
             return Err(Error::Other(e));
         }
@@ -301,13 +302,13 @@ impl<V: Vmm, R: GuestReadiness, H: Hooks<V>> SandboxEngine<V, R, H> {
         // 6. State transition, post_start hook, persist
         {
             let mut inst = instance_mutex.lock().await;
-            if inst.state != SandboxState::Creating {
+            if !matches!(inst.status, SandboxStatus::Created) {
                 return Err(Error::InvalidState(format!(
                     "sandbox {} state changed to {:?} during boot",
-                    id, inst.state
+                    id, inst.status
                 )));
             }
-            inst.state = SandboxState::Running;
+            inst.status = SandboxStatus::Running(pids.vmm_pid.unwrap_or(0));
 
             {
                 let mut ctx = inst.make_ctx();
@@ -355,11 +356,18 @@ impl<V: Vmm, R: GuestReadiness, H: Hooks<V>> SandboxEngine<V, R, H> {
         let mut instance = instance_mutex.lock().await;
 
         // Idempotent: containerd may call StopSandbox multiple times.
-        if instance.state == SandboxState::Stopped {
+        if matches!(instance.status, SandboxStatus::Stopped(_, _)) {
             return Ok(());
         }
-
-        let new_state = instance.state.transition(StateEvent::Stop)?;
+        if !matches!(
+            instance.status,
+            SandboxStatus::Created | SandboxStatus::Running(_)
+        ) {
+            return Err(Error::InvalidState(format!(
+                "cannot stop sandbox {} in state {:?}",
+                id, instance.status
+            )));
+        }
 
         // Force-remove all containers before stopping the VM
         let container_ids: Vec<String> = instance.containers.keys().cloned().collect();
@@ -400,7 +408,7 @@ impl<V: Vmm, R: GuestReadiness, H: Hooks<V>> SandboxEngine<V, R, H> {
             vmm_common::network::restore_physical_devices(&net.physical_nics).await;
         }
 
-        instance.state = new_state;
+        instance.status = SandboxStatus::Stopped(0, unix_now_nanos());
         instance.dump().await?;
         drop(instance);
         self.runtime.cleanup_sandbox(id).await;
@@ -414,17 +422,15 @@ impl<V: Vmm, R: GuestReadiness, H: Hooks<V>> SandboxEngine<V, R, H> {
         let instance_mutex = self.get_sandbox(id).await?;
         {
             let mut instance = instance_mutex.lock().await;
-            let event = if force {
-                StateEvent::ForceDelete
-            } else {
-                StateEvent::Delete
-            };
-            let new_state = instance.state.transition(event)?;
-
+            if !force && !matches!(instance.status, SandboxStatus::Stopped(_, _)) {
+                return Err(Error::InvalidState(format!(
+                    "cannot delete sandbox {} in state {:?}: stop it first",
+                    id, instance.status
+                )));
+            }
             if force {
                 instance.vmm.stop(true).await.ok();
             }
-            instance.state = new_state;
             if !cgroups_rs::hierarchies::is_cgroup2_unified_mode() {
                 instance.cgroup.remove_sandbox_cgroups().ok();
             }
@@ -468,7 +474,7 @@ impl<V: Vmm, R: GuestReadiness, H: Hooks<V>> SandboxEngine<V, R, H> {
             let g = m.lock().await;
             summaries.push(SandboxSummary {
                 id: g.id.clone(),
-                state: g.state.clone(),
+                status: g.status.clone(),
             });
         }
         summaries
@@ -493,10 +499,10 @@ impl<V: Vmm, R: GuestReadiness, H: Hooks<V>> SandboxEngine<V, R, H> {
             let path = entry.path();
             match SandboxInstance::<V>::load(&path).await {
                 Ok(mut inst) => {
-                    if inst.state == SandboxState::Running {
+                    if matches!(inst.status, SandboxStatus::Running(_)) {
                         if let Err(e) = inst.vmm.recover().await {
                             tracing::warn!("recovery: vmm reconnect failed for {}: {}", inst.id, e);
-                            inst.state = SandboxState::Stopped;
+                            inst.status = SandboxStatus::Stopped(0, unix_now_nanos());
                         } else {
                             let vsock = inst.vmm.vsock_path().unwrap_or_default();
                             let exit_signal = inst.exit_signal.clone();
@@ -522,7 +528,7 @@ impl<V: Vmm, R: GuestReadiness, H: Hooks<V>> SandboxEngine<V, R, H> {
                             };
                             if !ready {
                                 inst.vmm.stop(true).await.ok();
-                                inst.state = SandboxState::Stopped;
+                                inst.status = SandboxStatus::Stopped(0, unix_now_nanos());
                                 // Release any ttrpc client that wait_ready may have cached.
                                 self.runtime.cleanup_sandbox(&inst.id).await;
                                 // fall through to insert as Stopped
@@ -579,9 +585,11 @@ impl<V: Vmm, R: GuestReadiness, H: Hooks<V>> SandboxEngine<V, R, H> {
                 }
             }
             let mut inst = instance_mutex.lock().await;
-            if inst.state == SandboxState::Running {
+            if matches!(inst.status, SandboxStatus::Running(_)) {
                 tracing::warn!("sandbox {} VMM exited unexpectedly; marking Stopped", id);
-                inst.state = SandboxState::Stopped;
+                let exit_info = exit_rx.borrow().clone();
+                let exit_code = exit_info.map(|i| i.exit_code as u32).unwrap_or(0);
+                inst.status = SandboxStatus::Stopped(exit_code, unix_now_nanos());
                 inst.exit_signal.signal();
                 // Release the mutex before acquiring the write lock to avoid
                 // potential lock-order deadlocks.
@@ -719,4 +727,12 @@ fn build_network_config(
             netns: netns.to_string(),
         },
     }
+}
+
+/// Current time as Unix nanoseconds — used for `SandboxStatus::Stopped(_, ts)`.
+fn unix_now_nanos() -> i128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as i128
 }

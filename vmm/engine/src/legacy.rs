@@ -37,6 +37,7 @@ use std::sync::Arc;
 
 use containerd_sandbox::data::SandboxData;
 use containerd_sandbox::signal::ExitSignal;
+use containerd_sandbox::SandboxStatus;
 use serde::Deserialize;
 use serde_json::Value;
 use vmm_guest_runtime::{IpNet, NetworkInterface, Route};
@@ -45,7 +46,6 @@ use vmm_vm_trait::Vmm;
 use crate::instance::{
     ContainerState, NetworkState, SandboxCgroup, SandboxInstance, StorageMount, StorageMountKind,
 };
-use crate::state::SandboxState;
 
 /// Try to migrate a raw JSON value that was written by the old `KuasarSandbox`
 /// (i.e. it has a `"vm"` key but no `"vmm"` key) into a `SandboxInstance<V>`.
@@ -83,8 +83,8 @@ pub fn migrate<V: Vmm + Default>(raw: &Value) -> anyhow::Result<SandboxInstance<
     let vmm = V::from_legacy_vm(legacy.vm, &legacy.id, &legacy.base_dir)
         .map_err(|e| anyhow::anyhow!("from_legacy_vm: {}", e))?;
 
-    // ── Status → State ────────────────────────────────────────────────────────
-    let state = status_to_state(&legacy.status);
+    // ── Status → SandboxStatus ───────────────────────────────────────────────
+    let status = parse_legacy_status(&legacy.status);
 
     // ── Containers (KuasarContainer ≈ ContainerState — same field names/types) ─
     let containers = legacy
@@ -111,7 +111,7 @@ pub fn migrate<V: Vmm + Default>(raw: &Value) -> anyhow::Result<SandboxInstance<
     Ok(SandboxInstance {
         id: legacy.id,
         vmm,
-        state,
+        status,
         base_dir: legacy.base_dir,
         data: legacy.data,
         netns,
@@ -127,18 +127,32 @@ pub fn migrate<V: Vmm + Default>(raw: &Value) -> anyhow::Result<SandboxInstance<
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-/// Map old `SandboxStatus` JSON → new `SandboxState`.
+/// Map old `SandboxStatus` JSON → `SandboxStatus`.
 ///
 /// Old serialization (serde default enum):
-/// - `"Created"`            → Creating
-/// - `{"Running": <pid>}`   → Running
-/// - `{"Stopped": [c, ts]}` → Stopped
-fn status_to_state(status: &Value) -> SandboxState {
+/// - `"Created"`            → Created
+/// - `{"Running": <pid>}`   → Running(pid)
+/// - `{"Stopped": [c, ts]}` → Stopped(c, ts)
+fn parse_legacy_status(status: &Value) -> SandboxStatus {
     match status {
-        Value::String(s) if s == "Created" => SandboxState::Creating,
-        Value::Object(m) if m.contains_key("Running") => SandboxState::Running,
-        Value::Object(m) if m.contains_key("Stopped") => SandboxState::Stopped,
-        _ => SandboxState::Stopped,
+        Value::String(s) if s == "Created" => SandboxStatus::Created,
+        Value::Object(m) if m.contains_key("Running") => {
+            let pid = m.get("Running").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+            SandboxStatus::Running(pid)
+        }
+        Value::Object(m) if m.contains_key("Stopped") => {
+            let arr = m.get("Stopped").and_then(|v| v.as_array());
+            let code = arr
+                .and_then(|a| a.first())
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as u32;
+            let ts = arr
+                .and_then(|a| a.get(1))
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0) as i128;
+            SandboxStatus::Stopped(code, ts)
+        }
+        _ => SandboxStatus::Stopped(0, 0),
     }
 }
 

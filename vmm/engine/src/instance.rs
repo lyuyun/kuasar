@@ -19,6 +19,7 @@ use std::sync::Arc;
 
 pub use containerd_sandbox::data::SandboxData;
 pub use containerd_sandbox::signal::ExitSignal;
+use containerd_sandbox::SandboxStatus;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 pub use vmm_common::cgroup::SandboxCgroup;
@@ -28,7 +29,6 @@ use vmm_vm_trait::Vmm;
 use vmm_vm_trait::SandboxCtx;
 
 use crate::error::{Error, Result};
-use crate::state::SandboxState;
 
 // ── Re-exports for K8sAdapter ─────────────────────────────────────────────────
 pub use containerd_sandbox::data::{ContainerData, ProcessData};
@@ -122,7 +122,7 @@ pub struct SandboxInstance<V: Vmm> {
     /// to fail gracefully and mark the sandbox as Stopped.
     #[serde(default)]
     pub vmm: V,
-    pub state: SandboxState,
+    pub status: SandboxStatus,
     pub base_dir: String,
 
     /// Metadata forwarded from containerd (used by K8sAdapter for event publishing).
@@ -217,5 +217,5 @@ impl<V: Vmm + Serialize + DeserializeOwned + Default> SandboxInstance<V> {
 /// Compact summary returned by `SandboxEngine::list_sandboxes`.
 pub struct SandboxSummary {
     pub id: String,
-    pub state: SandboxState,
+    pub status: SandboxStatus,
 }

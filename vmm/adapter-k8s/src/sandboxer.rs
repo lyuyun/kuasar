@@ -37,7 +37,6 @@ use vmm_common::{
     RESOLV_FILENAME, SANDBOX_NS_PATH, SHARED_DIR_SUFFIX, STORAGE_FILE_PREFIX, UTS_NAMESPACE,
 };
 use vmm_engine::instance::{ContainerState, StorageMount, StorageMountKind};
-use vmm_engine::state::SandboxState;
 use vmm_engine::{CreateSandboxRequest, SandboxInstance};
 use vmm_guest_runtime::{ContainerRuntime, GuestReadiness};
 use vmm_vm_trait::{Hooks, HotPlugDevice, Vmm};
@@ -94,7 +93,7 @@ where
         let inst = inst_arc
             .try_lock()
             .map_err(|_| anyhow::anyhow!("sandbox lock contended"))?;
-        Ok(sandbox_state_to_status(&inst.state))
+        Ok(inst.status.clone())
     }
 
     async fn ping(&self) -> SandboxResult<()> {
@@ -410,16 +409,6 @@ where
             cgroup_parent,
             rootfs_disk: None,
         })
-    }
-}
-
-// ── State conversion ──────────────────────────────────────────────────────────
-
-fn sandbox_state_to_status(s: &SandboxState) -> SandboxStatus {
-    match s {
-        SandboxState::Creating => SandboxStatus::Created,
-        SandboxState::Running => SandboxStatus::Running(0),
-        SandboxState::Stopped | SandboxState::Deleted => SandboxStatus::Stopped(0, 0),
     }
 }
 

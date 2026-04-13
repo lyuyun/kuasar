@@ -33,10 +33,11 @@ use vmm_vm_trait::{
     VcpuThreads, Vmm, VmmCapabilities, VmmNetworkConfig,
 };
 
+use containerd_sandbox::SandboxStatus;
+
 use crate::config::EngineConfig;
 use crate::engine::SandboxEngine;
 use crate::error::Error;
-use crate::state::SandboxState;
 use crate::CreateSandboxRequest;
 
 // ── MockVmm ───────────────────────────────────────────────────────────────────
@@ -405,7 +406,7 @@ async fn create_sandbox_succeeds_state_creating() {
 
     let inst = engine.get_sandbox("sb1").await.unwrap();
     let guard = inst.lock().await;
-    assert_eq!(guard.state, SandboxState::Creating);
+    assert!(matches!(guard.status, SandboxStatus::Created));
     assert!(guard.base_dir.ends_with("sb1"));
 }
 
@@ -497,7 +498,7 @@ async fn start_sandbox_boot_path_state_running() {
 
     let inst = engine.get_sandbox("sb-start").await.unwrap();
     let guard = inst.lock().await;
-    assert_eq!(guard.state, SandboxState::Running);
+    assert!(matches!(guard.status, SandboxStatus::Running(_)));
 }
 
 #[tokio::test]
@@ -577,7 +578,10 @@ async fn start_sandbox_ready_timeout_state_stopped() {
     );
 
     let inst = engine.get_sandbox("sb-timeout").await.unwrap();
-    assert_eq!(inst.lock().await.state, SandboxState::Stopped);
+    assert!(matches!(
+        inst.lock().await.status,
+        SandboxStatus::Stopped(_, _)
+    ));
 }
 
 #[tokio::test]
@@ -590,7 +594,10 @@ async fn stop_sandbox_running_to_stopped() {
     engine.stop_sandbox("sb-stop", false).await.unwrap();
 
     let inst = engine.get_sandbox("sb-stop").await.unwrap();
-    assert_eq!(inst.lock().await.state, SandboxState::Stopped);
+    assert!(matches!(
+        inst.lock().await.status,
+        SandboxStatus::Stopped(_, _)
+    ));
 }
 
 #[tokio::test]
@@ -605,7 +612,10 @@ async fn stop_sandbox_idempotent() {
     engine.stop_sandbox("sb-idem", false).await.unwrap();
 
     let inst = engine.get_sandbox("sb-idem").await.unwrap();
-    assert_eq!(inst.lock().await.state, SandboxState::Stopped);
+    assert!(matches!(
+        inst.lock().await.status,
+        SandboxStatus::Stopped(_, _)
+    ));
 }
 
 #[tokio::test]
@@ -743,7 +753,7 @@ async fn unexpected_vmm_exit_removes_sandbox_and_fires_signal() {
     let exit_signal = {
         let inst_arc = engine.get_sandbox("sb-crash").await.unwrap();
         let inst = inst_arc.lock().await;
-        assert_eq!(inst.state, SandboxState::Running);
+        assert!(matches!(inst.status, SandboxStatus::Running(_)));
         inst.exit_signal.clone()
     };
 

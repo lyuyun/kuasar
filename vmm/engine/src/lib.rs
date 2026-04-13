@@ -19,19 +19,18 @@ pub mod engine;
 pub mod error;
 pub mod instance;
 pub mod legacy;
-pub mod state;
 
 #[cfg(test)]
 mod tests;
 
 pub use config::EngineConfig;
+pub use containerd_sandbox::SandboxStatus;
 pub use engine::SandboxEngine;
 pub use error::{Error, Result};
 pub use instance::{
     ContainerState, NetworkState, ProcessState, SandboxInstance, SandboxSummary, StorageMount,
     StorageMountKind,
 };
-pub use state::{SandboxState, StateEvent};
 
 use containerd_sandbox::data::SandboxData;
 use vmm_vm_trait::DiskConfig;

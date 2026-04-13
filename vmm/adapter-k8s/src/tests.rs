@@ -393,8 +393,10 @@ async fn sandboxer_start_calls_engine_start() {
     start_sandbox(&adapter, "sb-start").await;
 
     let inst = adapter.engine.get_sandbox("sb-start").await.unwrap();
-    use vmm_engine::state::SandboxState;
-    assert_eq!(inst.lock().await.state, SandboxState::Running);
+    assert!(matches!(
+        inst.lock().await.status,
+        containerd_sandbox::SandboxStatus::Running(_)
+    ));
 }
 
 #[tokio::test]
