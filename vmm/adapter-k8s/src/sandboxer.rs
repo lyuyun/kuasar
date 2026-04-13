@@ -27,6 +27,7 @@ use containerd_sandbox::spec::{JsonSpec, Mount as SpecMount};
 use containerd_sandbox::{
     Container, ContainerOption, Sandbox, SandboxOption, SandboxStatus, Sandboxer,
 };
+use containerd_shim::mount::mount_rootfs;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use tokio::sync::Mutex;
@@ -501,8 +502,32 @@ async fn attach_container_storages(
                 bus_addr: None,
                 fstype: String::new(),
             });
+        } else if m.r#type == "overlay" {
+            // Overlay rootfs: mount on the host into the shared virtiofs directory so the
+            // merged view is accessible inside the VM.  Each container gets its own overlay
+            // (upperdirs differ), so there is intentionally no dedup here.
+            inst.id_generator += 1;
+            let storage_id = format!("storage{}", inst.id_generator);
+            let host_dest = format!("{}/{}/{}", inst.base_dir, SHARED_DIR_SUFFIX, storage_id);
+            tokio::fs::create_dir_all(&host_dest)
+                .await
+                .map_err(|e| anyhow::anyhow!("create overlay dest {}: {}", host_dest, e))?;
+            mount_rootfs(Some(&m.r#type), Some(&m.source), &m.options, &host_dest)
+                .map_err(|e| anyhow::anyhow!("mount overlay rootfs: {}", e))?;
+            let guest_path = format!("{}/{}", KUASAR_STATE_DIR, storage_id);
+            inst.storages.push(StorageMount {
+                id: storage_id,
+                ref_containers: vec![container_id.to_string()],
+                host_path: m.source.clone(),
+                mount_dest: Some(host_dest),
+                guest_path,
+                kind: StorageMountKind::VirtioFs,
+                device_id: None,
+                bus_addr: None,
+                fstype: String::new(),
+            });
         }
-        // tmpfs, shm, overlay handled by vmm-task; skip on host side
+        // tmpfs, shm handled by vmm-task; skip on host side
     }
     Ok(())
 }

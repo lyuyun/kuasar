@@ -15,8 +15,7 @@ limitations under the License.
 */
 
 use std::{
-    convert::TryFrom, io::SeekFrom, os::unix::prelude::ExitStatusExt, path::Path,
-    process::ExitStatus, sync::Arc,
+    convert::TryFrom, os::unix::prelude::ExitStatusExt, path::Path, process::ExitStatus, sync::Arc,
 };
 
 use async_trait::async_trait;
@@ -46,8 +45,7 @@ use oci_spec::runtime::{LinuxResources, Process, Spec};
 use runc::{options::GlobalOpts, Runc, Spawner};
 use serde::Deserialize;
 use tokio::{
-    fs::{remove_file, File},
-    io::{AsyncBufReadExt, AsyncSeekExt, BufReader},
+    fs::remove_file,
     process::{ChildStderr, ChildStdout, Command},
     sync::Mutex,
 };
@@ -265,49 +263,22 @@ pub async fn runtime_error(bundle: &str, r_err: runc::error::Error, msg: &str) -
 
 async fn get_last_runtime_error(bundle: &str) -> Result<String> {
     let log_path = Path::new(bundle).join("log.json");
+    let content = tokio::fs::read_to_string(&log_path)
+        .await
+        .map_err(|e| other!("unable to open OCI runtime log file: {}", e))?;
     let mut rt_msg = String::new();
-    match File::open(log_path).await {
-        Err(e) => Err(other!("unable to open OCI runtime log file: {}", e)),
-        Ok(file) => {
-            let mut reader = BufReader::new(file);
-            let file_size = reader
-                .seek(SeekFrom::End(0))
-                .await
-                .map_err(other_error!(e, "error seek from start"))?;
-
-            let mut pre_buffer: Option<Vec<u8>> = None;
-            let mut buffer = Vec::new();
-
-            for offset in (0..file_size).rev() {
-                if offset == 0 {
-                    break;
-                }
-                reader
-                    .seek(SeekFrom::Start(offset))
-                    .await
-                    .map_err(other_error!(e, "error seek"))?;
-                let result = reader
-                    .read_until(b'\n', &mut buffer)
-                    .await
-                    .map_err(other_error!(e, "reading from cursor fail"))?;
-                if result == 1 && pre_buffer.is_some() {
-                    let line = String::from_utf8_lossy(&pre_buffer.unwrap()).into_owned();
-                    match serde_json::from_str::<Log>(&line) {
-                        Err(e) => return Err(other!("unable to parse log msg({}): {}", line, e)),
-                        Ok(log) => {
-                            if log.level == "error" {
-                                rt_msg = log.msg.trim().to_string();
-                                break;
-                            }
-                        }
-                    }
-                }
-                pre_buffer = Some(buffer.clone());
-                buffer.clear();
+    for line in content.lines().rev() {
+        if line.is_empty() {
+            continue;
+        }
+        if let Ok(log) = serde_json::from_str::<Log>(line) {
+            if log.level == "error" {
+                rt_msg = log.msg.trim().to_string();
+                break;
             }
-            Ok(rt_msg)
         }
     }
+    Ok(rt_msg)
 }
 
 #[async_trait]
