@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use containerd_sandbox::error::Result;
+use log::info;
 
 use crate::{
     cloud_hypervisor::CloudHypervisorVM, sandbox::KuasarSandbox, utils::get_resources, vm::Hooks,
@@ -28,13 +29,21 @@ impl Hooks<CloudHypervisorVM> for CloudHypervisorHooks {
     async fn pre_start(&self, sandbox: &mut KuasarSandbox<CloudHypervisorVM>) -> Result<()> {
         process_annotation(sandbox).await?;
         process_config(sandbox).await?;
+        // Start virtiofsd before booting the VM.
+        if !sandbox.vm.virtiofsd_config.socket_path.is_empty() {
+            let pid = sandbox.vm.start_virtiofsd().await?;
+            info!(
+                "virtiofsd for sandbox {} started with pid {}",
+                sandbox.id, pid
+            );
+            sandbox.vm.pids.affiliated_pids.push(pid);
+        }
         Ok(())
     }
 
     async fn post_start(&self, sandbox: &mut KuasarSandbox<CloudHypervisorVM>) -> Result<()> {
         sandbox.data.task_address = format!("ttrpc+{}", sandbox.vm.agent_socket);
-        // sync clock
-        sandbox.sync_clock().await;
+        sandbox.start_clock_sync();
         Ok(())
     }
 }

@@ -104,11 +104,9 @@ pub struct StratoVirtVM {
 
 #[async_trait]
 impl VM for StratoVirtVM {
-    async fn start(&mut self) -> Result<u32> {
-        // launch virtiofs daemon process
-        debug!("start virtiofs daemon process");
-        self.start_virtiofs_daemon().await?;
-
+    /// Boot StratoVirt. The virtiofs daemon is started by `StratoVirtHooks::pre_start()`
+    /// before this method is called.
+    async fn boot(&mut self) -> Result<u32> {
         debug!("start vm {}", self.id);
         let wait_chan = self.launch().await?;
         self.wait_chan = Some(wait_chan);
@@ -275,7 +273,7 @@ impl VM for StratoVirtVM {
         Ok(())
     }
 
-    fn socket_address(&self) -> String {
+    fn vsock_path(&self) -> String {
         self.agent_socket.to_string()
     }
 
@@ -560,7 +558,7 @@ impl StratoVirtVM {
         });
     }
 
-    async fn start_virtiofs_daemon(&mut self) -> Result<()> {
+    pub(crate) async fn start_virtiofs_daemon(&mut self) -> Result<()> {
         self.virtiofs_daemon
             .as_mut()
             .unwrap()

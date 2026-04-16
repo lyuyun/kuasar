@@ -21,6 +21,7 @@ mod device;
 mod cgroup;
 mod client;
 mod container;
+pub mod guest_runtime;
 mod io;
 mod network;
 mod param;
