@@ -43,7 +43,7 @@ use vmm_common::{
 use crate::{
     cgroup::{SandboxCgroup, DEFAULT_CGROUP_PARENT_PATH},
     container::KuasarContainer,
-    guest_runtime::{GuestRuntime, RuntimeKind, VmmTaskRuntime},
+    guest_runtime::{ApplianceRuntime, GuestRuntime, RuntimeKind, VmmTaskRuntime},
     network::{Network, NetworkConfig},
     utils::{get_dns_config, get_hostname, get_resources, get_sandbox_cgroup_parent_path},
     vm::{Hooks, Recoverable, VMFactory, VM},
@@ -451,6 +451,7 @@ where
             let address = sb.vm.vsock_path();
             let mut runtime: Box<dyn GuestRuntime> = match sb.runtime_kind {
                 RuntimeKind::VmmTask => Box::new(VmmTaskRuntime::new()),
+                RuntimeKind::Appliance => Box::new(ApplianceRuntime::new(&sb.data.id)),
             };
             if let Err(e) = runtime.reconnect(&address).await {
                 if let Err(re) = sb.stop(true).await {
@@ -715,12 +716,32 @@ pub fn has_shared_pid_namespace(data: &SandboxData) -> bool {
     false
 }
 
+/// Selects the guest coordination protocol used by the sandboxer.
+///
+/// The value maps directly to the [`RuntimeKind`] injected into each sandbox
+/// at creation time and is read from the `[sandbox]` section of the TOML
+/// config file (field `mode`).
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SandboxMode {
+    /// Uses ttrpc to `vmm-task` over vsock. (default)
+    #[default]
+    Standard,
+    /// Guest connects back to host over vsock with a READY message;
+    /// no `vmm-task`, no virtiofsd.
+    Appliance,
+}
+
 #[derive(Default, Debug, Deserialize)]
 pub struct SandboxConfig {
     #[serde(default)]
     pub log_level: String,
     #[serde(default)]
     pub enable_tracing: bool,
+    /// Selects between `standard` (ttrpc/vmm-task) and `appliance` (reverse vsock).
+    /// Defaults to `standard` if omitted.
+    #[serde(default)]
+    pub mode: SandboxMode,
 }
 
 impl SandboxConfig {

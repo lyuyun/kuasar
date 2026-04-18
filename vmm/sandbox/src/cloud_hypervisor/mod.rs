@@ -46,6 +46,8 @@ use crate::{
     vm::{Pids, VcpuThreads, VM},
 };
 
+pub mod appliance_factory;
+pub mod appliance_hooks;
 mod client;
 pub mod config;
 pub mod devices;
