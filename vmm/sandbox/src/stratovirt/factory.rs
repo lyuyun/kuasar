@@ -45,16 +45,17 @@ pub struct StratoVirtVMFactory {
     default_config: StratoVirtVMConfig,
 }
 
-#[async_trait]
-impl VMFactory for StratoVirtVMFactory {
-    type VM = StratoVirtVM;
-    type Config = StratoVirtVMConfig;
-
-    fn new(config: Self::Config) -> Self {
+impl StratoVirtVMFactory {
+    pub fn new(config: StratoVirtVMConfig) -> Self {
         Self {
             default_config: config,
         }
     }
+}
+
+#[async_trait]
+impl VMFactory for StratoVirtVMFactory {
+    type VM = StratoVirtVM;
 
     async fn create_vm(
         &self,

@@ -26,9 +26,8 @@ use containerd_sandbox::{
     utils::cleanup_mounts,
     ContainerOption, Sandbox, SandboxOption, SandboxStatus, Sandboxer,
 };
-use containerd_shim::{protos::api::Envelope, util::write_str_to_file};
+use containerd_shim::util::write_str_to_file;
 use log::{debug, error, info, warn};
-use protobuf::{well_known_types::any::Any, MessageField};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tokio::{
     fs::{copy, create_dir_all, remove_dir_all, OpenOptions},
@@ -36,18 +35,17 @@ use tokio::{
     sync::{Mutex, RwLock},
 };
 use tracing::instrument;
-use ttrpc::context::with_timeout;
 use vmm_common::{
-    api::{empty::Empty, sandbox::SetupSandboxRequest, sandbox_ttrpc::SandboxServiceClient},
-    storage::Storage,
-    ETC_HOSTS, ETC_RESOLV, HOSTNAME_FILENAME, HOSTS_FILENAME, RESOLV_FILENAME, SHARED_DIR_SUFFIX,
+    storage::Storage, ETC_HOSTS, ETC_RESOLV, HOSTNAME_FILENAME, HOSTS_FILENAME, RESOLV_FILENAME,
+    SHARED_DIR_SUFFIX,
 };
 
 use crate::{
     cgroup::{SandboxCgroup, DEFAULT_CGROUP_PARENT_PATH},
-    client::{client_check, client_setup_sandbox, client_sync_clock, new_sandbox_client},
     container::KuasarContainer,
+    guest_runtime::{GuestRuntime, RuntimeKind, VmmTaskRuntime},
     network::{Network, NetworkConfig},
+    profile::SandboxProfile,
     utils::{get_dns_config, get_hostname, get_resources, get_sandbox_cgroup_parent_path},
     vm::{Hooks, Recoverable, VMFactory, VM},
 };
@@ -69,9 +67,9 @@ where
     H: Hooks<F::VM>,
     F::VM: VM + Sync + Send,
 {
-    pub fn new(config: SandboxConfig, vmm_config: F::Config, hooks: H) -> Self {
+    pub fn new(config: SandboxConfig, factory: F, hooks: H) -> Self {
         Self {
-            factory: F::new(vmm_config),
+            factory,
             hooks,
             config,
             sandboxes: Arc::new(Default::default()),
@@ -139,8 +137,13 @@ pub struct KuasarSandbox<V: VM> {
     pub(crate) storages: Vec<Storage>,
     pub(crate) id_generator: u32,
     pub(crate) network: Option<Network>,
-    #[serde(skip, default)]
-    pub(crate) client: Arc<Mutex<Option<SandboxServiceClient>>>,
+    /// Identifies which [`GuestRuntime`] implementation is in use.
+    /// Persisted so the recovery path can reconstruct the correct runtime type.
+    #[serde(default)]
+    pub(crate) runtime_kind: RuntimeKind,
+    /// Guest runtime (not serialized; rebuilt during recovery).
+    #[serde(skip)]
+    pub(crate) runtime: Option<Box<dyn GuestRuntime>>,
     #[serde(skip, default)]
     pub(crate) exit_signal: Arc<ExitSignal>,
     #[serde(default)]
@@ -191,7 +194,8 @@ where
             storages: vec![],
             id_generator: 0,
             network: None,
-            client: Arc::new(Mutex::new(None)),
+            runtime_kind: RuntimeKind::VmmTask,
+            runtime: Some(Box::new(VmmTaskRuntime::new())),
             exit_signal: Arc::new(ExitSignal::default()),
             sandbox_cgroups,
         };
@@ -442,15 +446,24 @@ where
                 }
                 return Err(e);
             };
-            if let Err(e) = sb.init_client().await {
+            // Rebuild the guest runtime and reconnect to the already-running guest agent.
+            // Use reconnect() rather than wait_ready(): the guest network is already
+            // configured, so setup_sandbox() must not be called again.
+            let address = sb.vm.vsock_path();
+            let mut runtime: Box<dyn GuestRuntime> = match sb.runtime_kind {
+                RuntimeKind::VmmTask => Box::new(VmmTaskRuntime::new()),
+            };
+            if let Err(e) = runtime.reconnect(&address).await {
                 if let Err(re) = sb.stop(true).await {
-                    warn!("roll back in recover, init task client and stop: {}", re);
+                    warn!("roll back in recover, reconnect runtime and stop: {}", re);
                     return Err(e);
                 }
                 return Err(e);
             }
-            sb.sync_clock().await;
-            sb.forward_events().await;
+            let exit_signal = sb.exit_signal.clone();
+            runtime.start_sync_clock(&sb.id, exit_signal.clone());
+            runtime.start_forward_events(exit_signal);
+            sb.runtime = Some(runtime);
         }
         // recover the sandbox_cgroups in the sandbox object
         sb.sandbox_cgroups =
@@ -466,25 +479,32 @@ where
 {
     #[instrument(skip_all)]
     async fn start(&mut self) -> Result<()> {
-        let pid = self.vm.start().await?;
+        // Boot the VMM process (virtiofsd has already been started by pre_start hook).
+        let pid = self.vm.boot().await?;
 
-        if let Err(e) = self.init_client().await {
+        // Connect to the guest agent and wait for readiness.
+        let address = self.vm.vsock_path();
+        let runtime = self.runtime.as_mut().ok_or_else(|| -> Error {
+            anyhow!("KuasarSandbox has no GuestRuntime; this is a programming error").into()
+        })?;
+        if let Err(e) = runtime
+            .wait_ready(&address, self.network.as_ref(), &self.data)
+            .await
+        {
             if let Err(re) = self.vm.stop(true).await {
-                warn!("roll back in init task client: {}", re);
+                warn!("roll back in wait_ready: {}", re);
                 return Err(e);
             }
             return Err(e);
         }
 
-        if let Err(e) = self.setup_sandbox().await {
-            if let Err(re) = self.vm.stop(true).await {
-                error!("roll back in setup sandbox client: {}", re);
-                return Err(e);
-            }
-            return Err(e);
+        // Start background tasks (clock sync, event forwarding).
+        let exit_signal = self.exit_signal.clone();
+        let id = self.id.clone();
+        if let Some(rt) = &self.runtime {
+            rt.start_sync_clock(&id, exit_signal.clone());
+            rt.start_forward_events(exit_signal);
         }
-
-        self.forward_events().await;
 
         self.status = SandboxStatus::Running(pid);
         Ok(())
@@ -539,61 +559,11 @@ where
         self.id_generator
     }
 
+    /// Start the background clock-sync task (called from `post_start` hooks).
     #[instrument(skip_all)]
-    async fn init_client(&mut self) -> Result<()> {
-        let mut client_guard = self.client.lock().await;
-        if client_guard.is_none() {
-            let addr = self.vm.socket_address();
-            if addr.is_empty() {
-                return Err(anyhow!("VM address is empty").into());
-            }
-            let client = new_sandbox_client(&addr).await?;
-            debug!("connected to task server {}", self.id);
-            client_check(&client).await?;
-            *client_guard = Some(client)
-        }
-        Ok(())
-    }
-
-    #[instrument(skip_all)]
-    pub(crate) async fn setup_sandbox(&mut self) -> Result<()> {
-        let mut req = SetupSandboxRequest::new();
-
-        if let Some(client) = &*self.client.lock().await {
-            // Set PodSandboxConfig
-            if let Some(config) = &self.data.config {
-                let config_str = serde_json::to_vec(config).map_err(|e| {
-                    Error::Other(anyhow!(
-                        "failed to marshal PodSandboxConfig to string, {:?}",
-                        e
-                    ))
-                })?;
-
-                let mut any = Any::new();
-                any.type_url = "PodSandboxConfig".to_string();
-                any.value = config_str;
-
-                req.config = MessageField::some(any);
-            }
-
-            if let Some(network) = self.network.as_ref() {
-                // Set interfaces
-                req.interfaces = network.interfaces().iter().map(|x| x.into()).collect();
-
-                // Set routes
-                req.routes = network.routes().iter().map(|x| x.into()).collect();
-            }
-
-            client_setup_sandbox(client, &req).await?;
-        }
-
-        Ok(())
-    }
-
-    #[instrument(skip_all)]
-    pub(crate) async fn sync_clock(&self) {
-        if let Some(client) = &*self.client.lock().await {
-            client_sync_clock(client, self.id.as_str(), self.exit_signal.clone());
+    pub(crate) fn start_clock_sync(&self) {
+        if let Some(rt) = &self.runtime {
+            rt.start_sync_clock(&self.id, self.exit_signal.clone());
         }
     }
 
@@ -709,44 +679,6 @@ where
         }
         Ok(())
     }
-
-    pub(crate) async fn forward_events(&mut self) {
-        if let Some(client) = &*self.client.lock().await {
-            let client = client.clone();
-            let exit_signal = self.exit_signal.clone();
-            tokio::spawn(async move {
-                let fut = async {
-                    loop {
-                        match client.get_events(with_timeout(0), &Empty::new()).await {
-                            Ok(resp) => {
-                                if let Err(e) =
-                                    crate::client::publish_event(convert_envelope(resp)).await
-                                {
-                                    error!("{}", e);
-                                }
-                            }
-                            Err(err) => {
-                                // if sandbox was closed, will get error Socket("early eof"),
-                                // so we should handle errors except this unexpected EOF error.
-                                if let ttrpc::error::Error::Socket(s) = &err {
-                                    if s.contains("early eof") {
-                                        break;
-                                    }
-                                }
-                                error!("failed to get oom event error {:?}", err);
-                                break;
-                            }
-                        }
-                    }
-                };
-
-                tokio::select! {
-                    _ = fut => {},
-                    _ = exit_signal.wait() => {},
-                }
-            });
-        }
-    }
 }
 
 // parse_dnsoptions parse DNS options into resolv.conf format content,
@@ -784,22 +716,16 @@ pub fn has_shared_pid_namespace(data: &SandboxData) -> bool {
     false
 }
 
-fn convert_envelope(envelope: vmm_common::api::events::Envelope) -> Envelope {
-    Envelope {
-        timestamp: envelope.timestamp,
-        namespace: envelope.namespace,
-        topic: envelope.topic,
-        event: envelope.event,
-        special_fields: protobuf::SpecialFields::default(),
-    }
-}
-
 #[derive(Default, Debug, Deserialize)]
 pub struct SandboxConfig {
     #[serde(default)]
     pub log_level: String,
     #[serde(default)]
     pub enable_tracing: bool,
+    /// Selects the guest coordination protocol and device topology.
+    /// Defaults to `standard` when the field is absent.
+    #[serde(default)]
+    pub profile: SandboxProfile,
 }
 
 impl SandboxConfig {
@@ -821,7 +747,7 @@ pub struct StaticDeviceSpec {
     pub(crate) _bdf: Vec<String>,
 }
 
-fn monitor<V: VM + 'static>(sandbox_mutex: Arc<Mutex<KuasarSandbox<V>>>) {
+fn monitor<V: VM + 'static>(sandbox_mutex: Arc<tokio::sync::Mutex<KuasarSandbox<V>>>) {
     tokio::spawn(async move {
         let mut rx = {
             let sandbox = sandbox_mutex.lock().await;
@@ -874,6 +800,40 @@ fn monitor<V: VM + 'static>(sandbox_mutex: Arc<Mutex<KuasarSandbox<V>>>) {
 
 #[cfg(test)]
 mod tests {
+    mod runtime_kind {
+        use crate::guest_runtime::RuntimeKind;
+
+        /// A sandbox.json from before `runtime_kind` was introduced must
+        /// deserialise correctly; the missing field must default to `VmmTask`.
+        #[test]
+        fn test_runtime_kind_field_defaults_on_legacy_json() {
+            // Simulate the minimal shape of a serialised KuasarSandbox that
+            // predates the runtime_kind field.  Only the field itself matters
+            // here; we verify that serde's `default` attribute handles absence.
+            #[derive(serde::Deserialize)]
+            struct Partial {
+                #[serde(default)]
+                runtime_kind: RuntimeKind,
+            }
+            let p: Partial = serde_json::from_str(r#"{}"#).unwrap();
+            assert!(
+                matches!(p.runtime_kind, RuntimeKind::VmmTask),
+                "legacy sandbox.json without runtime_kind must default to VmmTask"
+            );
+        }
+
+        /// The serialised value of `VmmTask` must be the stable JSON string
+        /// `"vmm_task"` — changing this would break recovery of existing sandboxes.
+        #[test]
+        fn test_vmm_task_serialized_value_is_stable() {
+            let json = serde_json::to_string(&RuntimeKind::VmmTask).unwrap();
+            assert_eq!(
+                json, r#""vmm_task""#,
+                "serialised RuntimeKind::VmmTask must remain \"vmm_task\""
+            );
+        }
+    }
+
     mod dns {
         use crate::sandbox::parse_dnsoptions;
 

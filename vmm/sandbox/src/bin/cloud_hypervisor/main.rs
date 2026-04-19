@@ -22,6 +22,7 @@ use vmm_sandboxer::{
     args,
     cloud_hypervisor::{factory::CloudHypervisorVMFactory, hooks::CloudHypervisorHooks},
     config::Config,
+    profile::SandboxProfile,
     sandbox::KuasarSandboxer,
     version,
 };
@@ -36,35 +37,37 @@ async fn main() {
 
     let config = Config::load_config(&args.config).await.unwrap();
 
-    // Update args log level if it not presents args but in config.
     let log_level = args.log_level.unwrap_or(config.sandbox.log_level());
-    let service_name = "kuasar-vmm-sandboxer-clh-service";
     trace::set_enabled(config.sandbox.enable_tracing);
+
+    let profile = config.sandbox.profile.clone();
+
+    // Service / sandboxer names are profile-specific for observability.
+    let (service_name, sandboxer_name) = match &profile {
+        SandboxProfile::Standard => (
+            "kuasar-vmm-sandboxer-clh-service",
+            "kuasar-vmm-sandboxer-clh",
+        ),
+    };
+
     trace::setup_tracing(&log_level, service_name).unwrap();
 
     let mut sandboxer: KuasarSandboxer<CloudHypervisorVMFactory, CloudHypervisorHooks> =
         KuasarSandboxer::new(
             config.sandbox,
-            config.hypervisor,
-            CloudHypervisorHooks::default(),
+            CloudHypervisorVMFactory::new(config.hypervisor, profile.clone()),
+            CloudHypervisorHooks::new(profile),
         );
 
     tokio::spawn(async move {
         signal::handle_signals(&log_level, service_name).await;
     });
 
-    // Do recovery job
     if Path::new(&args.dir).exists() {
         sandboxer.recover(&args.dir).await;
     }
 
-    // Run the sandboxer
-    containerd_sandbox::run(
-        "kuasar-vmm-sandboxer-clh",
-        &args.listen,
-        &args.dir,
-        sandboxer,
-    )
-    .await
-    .unwrap();
+    containerd_sandbox::run(sandboxer_name, &args.listen, &args.dir, sandboxer)
+        .await
+        .unwrap();
 }

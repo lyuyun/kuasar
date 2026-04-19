@@ -21,6 +21,7 @@ mod device;
 mod cgroup;
 mod client;
 mod container;
+pub mod guest_runtime;
 mod io;
 mod network;
 mod param;
@@ -29,6 +30,7 @@ mod vm;
 
 pub mod args;
 pub mod cloud_hypervisor;
+pub mod profile;
 pub mod config;
 pub mod kata_config;
 pub mod qemu;
