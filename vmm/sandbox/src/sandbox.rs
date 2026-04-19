@@ -43,7 +43,7 @@ use vmm_common::{
 use crate::{
     cgroup::{SandboxCgroup, DEFAULT_CGROUP_PARENT_PATH},
     container::KuasarContainer,
-    guest_runtime::{GuestRuntime, RuntimeKind, VmmTaskRuntime},
+    guest_runtime::{ApplianceRuntime, GuestRuntime, RuntimeKind, VmmTaskRuntime},
     network::{Network, NetworkConfig},
     profile::SandboxProfile,
     utils::{get_dns_config, get_hostname, get_resources, get_sandbox_cgroup_parent_path},
@@ -452,6 +452,7 @@ where
             let address = sb.vm.vsock_path();
             let mut runtime: Box<dyn GuestRuntime> = match sb.runtime_kind {
                 RuntimeKind::VmmTask => Box::new(VmmTaskRuntime::new()),
+                RuntimeKind::Appliance => Box::new(ApplianceRuntime::new(&sb.data.id)),
             };
             if let Err(e) = runtime.reconnect(&address).await {
                 if let Err(re) = sb.stop(true).await {

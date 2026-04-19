@@ -27,6 +27,16 @@ use crate::{
     vm::VMFactory,
 };
 
+/// Cloud Hypervisor vsock reverse-connection naming convention:
+///   host socket path = <vsock_socket_path>_<port>
+///
+/// In Appliance mode the guest's init connects to vsock CID 2 (host) port 1024.
+/// Cloud Hypervisor proxies that connection to `task.vsock_1024` on the host.
+/// [`ApplianceRuntime`] binds and listens on that path.
+///
+/// [`ApplianceRuntime`]: crate::guest_runtime::ApplianceRuntime
+const APPLIANCE_VSOCK_PORT: u32 = 1024;
+
 pub struct CloudHypervisorVMFactory {
     vm_config: CloudHypervisorVMConfig,
     profile: SandboxProfile,
@@ -62,13 +72,20 @@ impl VMFactory for CloudHypervisorVMFactory {
             vm.add_device(rng);
         }
 
-        // add vsock device; host connects to guest vmm-task via hvsock
+        // Add vsock device.
+        //
+        // Standard: host connects to guest vmm-task ttrpc server via hvsock.
+        // Appliance: guest connects back to host; CLH proxies the connection to
+        //   a Unix socket at `<vsock_socket_path>_<port>` on the host.
         let vsock_socket_path = format!("{}/task.vsock", s.base_dir);
         let vsock = Vsock::new(3, &vsock_socket_path, "vsock");
         vm.add_device(vsock);
 
         vm.agent_socket = match &self.profile {
             SandboxProfile::Standard => format!("hvsock://{}:1024", vsock_socket_path),
+            SandboxProfile::Appliance => {
+                format!("unix://{}_{}", vsock_socket_path, APPLIANCE_VSOCK_PORT)
+            }
         };
 
         // add console device
@@ -76,7 +93,7 @@ impl VMFactory for CloudHypervisorVMFactory {
         let console = Console::new(&console_path, "console");
         vm.add_device(console);
 
-        // add virtio-fs device (skipped when profile does not need virtiofsd)
+        // add virtio-fs device (Appliance sandboxes have no shared directory)
         if self.profile.needs_virtiofsd() && !vm.virtiofsd_config.socket_path.is_empty() {
             let fs = Fs::new("fs", &vm.virtiofsd_config.socket_path, "kuasar");
             vm.add_device(fs);

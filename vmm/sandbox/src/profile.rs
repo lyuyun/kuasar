@@ -31,7 +31,7 @@ limitations under the License.
 
 use serde::{Deserialize, Serialize};
 
-use crate::guest_runtime::{GuestRuntime, RuntimeKind, VmmTaskRuntime};
+use crate::guest_runtime::{ApplianceRuntime, GuestRuntime, RuntimeKind, VmmTaskRuntime};
 
 /// Selects the guest coordination protocol and device topology for a sandbox.
 ///
@@ -46,6 +46,11 @@ pub enum SandboxProfile {
     /// virtiofsd for shared filesystem access.
     #[default]
     Standard,
+
+    /// Appliance mode: the guest application connects *back* to the host
+    /// over vsock and sends a JSON READY message.  No `vmm-task`, no
+    /// virtiofsd — the guest manages its own filesystem.
+    Appliance,
 }
 
 impl SandboxProfile {
@@ -54,13 +59,15 @@ impl SandboxProfile {
     pub fn runtime_kind(&self) -> RuntimeKind {
         match self {
             Self::Standard => RuntimeKind::VmmTask,
+            Self::Appliance => RuntimeKind::Appliance,
         }
     }
 
     /// Construct the host-side [`GuestRuntime`] for this profile.
-    pub fn create_runtime(&self, _sandbox_id: &str) -> Box<dyn GuestRuntime> {
+    pub fn create_runtime(&self, sandbox_id: &str) -> Box<dyn GuestRuntime> {
         match self {
             Self::Standard => Box::new(VmmTaskRuntime::new()),
+            Self::Appliance => Box::new(ApplianceRuntime::new(sandbox_id)),
         }
     }
 
@@ -69,6 +76,7 @@ impl SandboxProfile {
     pub fn needs_virtiofsd(&self) -> bool {
         match self {
             Self::Standard => true,
+            Self::Appliance => false,
         }
     }
 
@@ -80,6 +88,7 @@ impl SandboxProfile {
     pub fn task_address(&self, agent_socket: &str) -> Option<String> {
         match self {
             Self::Standard => Some(format!("ttrpc+{}", agent_socket)),
+            Self::Appliance => None,
         }
     }
 }
