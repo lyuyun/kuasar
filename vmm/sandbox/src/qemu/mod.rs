@@ -100,12 +100,9 @@ pub struct QemuVM {
 
 #[async_trait]
 impl VM for QemuVM {
-    async fn start(&mut self) -> Result<u32> {
+    /// Boot QEMU. Virtiofsd is started by `QemuHooks::pre_start()` before this is called.
+    async fn boot(&mut self) -> Result<u32> {
         debug!("start vm {}", self.id);
-        if self.virtiofsd_config.is_some() {
-            let virtiofsd_pid = self.start_virtiofsd().await?;
-            self.pids.affiliated_pids.push(virtiofsd_pid);
-        }
         let wait_chan = self.launch().await?;
         self.wait_chan = Some(wait_chan);
         let start_time = SystemTime::now();
@@ -304,7 +301,7 @@ impl VM for QemuVM {
         Ok(())
     }
 
-    fn socket_address(&self) -> String {
+    fn vsock_path(&self) -> String {
         self.agent_socket.to_string()
     }
 
@@ -460,7 +457,7 @@ impl QemuVM {
         }
     }
 
-    async fn start_virtiofsd(&self) -> Result<u32> {
+    pub(crate) async fn start_virtiofsd(&self) -> Result<u32> {
         //create_dir_all(&self.virtiofsd_config.shared_dir).await?;
         let virtiofsd_config = self.virtiofsd_config.clone().unwrap();
         let params = virtiofsd_config.to_cmdline_params("--");

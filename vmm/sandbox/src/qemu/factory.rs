@@ -45,16 +45,17 @@ pub struct QemuVMFactory {
     default_config: QemuVMConfig,
 }
 
-#[async_trait]
-impl VMFactory for QemuVMFactory {
-    type VM = QemuVM;
-    type Config = QemuVMConfig;
-
-    fn new(config: Self::Config) -> Self {
+impl QemuVMFactory {
+    pub fn new(config: QemuVMConfig) -> Self {
         Self {
             default_config: config,
         }
     }
+}
+
+#[async_trait]
+impl VMFactory for QemuVMFactory {
+    type VM = QemuVM;
 
     async fn create_vm(
         &self,

@@ -120,7 +120,8 @@ impl CloudHypervisorVM {
         ))
     }
 
-    async fn start_virtiofsd(&self) -> Result<u32> {
+    /// Start the virtiofsd daemon for shared directory access.
+    pub(crate) async fn start_virtiofsd(&self) -> Result<u32> {
         create_dir_all(&self.virtiofsd_config.shared_dir).await?;
         let params = self.virtiofsd_config.to_cmdline_params("--");
         let mut cmd = tokio::process::Command::new(&self.virtiofsd_config.path);
@@ -158,12 +159,11 @@ impl CloudHypervisorVM {
 
 #[async_trait]
 impl VM for CloudHypervisorVM {
+    /// Boot cloud-hypervisor. Virtiofsd is started by `CloudHypervisorHooks::pre_start()`
+    /// before this method is called.
     #[instrument(skip_all)]
-    async fn start(&mut self) -> Result<u32> {
+    async fn boot(&mut self) -> Result<u32> {
         create_dir_all(&self.base_dir).await?;
-        let virtiofsd_pid = self.start_virtiofsd().await?;
-        // TODO: add child virtiofsd process
-        self.pids.affiliated_pids.push(virtiofsd_pid);
         let mut params = self.config.to_cmdline_params("--");
         for d in self.devices.iter() {
             params.extend(d.to_cmdline_params("--"));
@@ -305,7 +305,7 @@ impl VM for CloudHypervisorVM {
     }
 
     #[instrument(skip_all)]
-    fn socket_address(&self) -> String {
+    fn vsock_path(&self) -> String {
         self.agent_socket.to_string()
     }
 
@@ -346,8 +346,12 @@ impl VM for CloudHypervisorVM {
 impl crate::vm::Recoverable for CloudHypervisorVM {
     #[instrument(skip_all)]
     async fn recover(&mut self) -> Result<()> {
-        self.client = Some(self.create_client().await?);
         let pid = self.pid()?;
+        // Verify the hypervisor process is still alive before spending up to
+        // CLOUD_HYPERVISOR_START_TIMEOUT_IN_SEC seconds retrying the API socket.
+        signal::kill(Pid::from_raw(pid as i32), None)
+            .map_err(|_| anyhow!("cloud-hypervisor process {} is no longer running", pid))?;
+        self.client = Some(self.create_client().await?);
         let (tx, rx) = channel((0u32, 0i128));
         tokio::spawn(async move {
             let wait_result = wait_pid(pid as i32).await;

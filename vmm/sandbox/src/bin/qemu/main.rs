@@ -59,7 +59,7 @@ async fn main() {
 
     let mut sandboxer: KuasarSandboxer<QemuVMFactory, QemuHooks> = KuasarSandboxer::new(
         config.sandbox,
-        config.hypervisor.clone(),
+        QemuVMFactory::new(config.hypervisor.clone()),
         QemuHooks::new(config.hypervisor),
     );
 

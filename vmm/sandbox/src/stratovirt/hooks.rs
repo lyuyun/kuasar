@@ -16,6 +16,7 @@ limitations under the License.
 
 use async_trait::async_trait;
 use containerd_sandbox::error::Result;
+use log::info;
 
 use crate::{
     sandbox::KuasarSandbox,
@@ -36,15 +37,20 @@ impl StratoVirtHooks {
 
 #[async_trait]
 impl Hooks<StratoVirtVM> for StratoVirtHooks {
-    async fn pre_start(&self, _sandbox: &mut KuasarSandbox<StratoVirtVM>) -> Result<()> {
-        // TODO
+    async fn pre_start(&self, sandbox: &mut KuasarSandbox<StratoVirtVM>) -> Result<()> {
+        // Start virtiofs daemon before booting the VM.
+        if sandbox.vm.virtiofs_daemon.is_some() {
+            sandbox.vm.start_virtiofs_daemon().await?;
+            info!("virtiofs daemon for sandbox {} started", sandbox.id);
+        }
         Ok(())
     }
 
     async fn post_start(&self, sandbox: &mut KuasarSandbox<StratoVirtVM>) -> Result<()> {
         sandbox.data.task_address = format!("ttrpc+{}", sandbox.vm.agent_socket);
-        // sync clock
-        sandbox.sync_clock().await;
+        sandbox
+            .runtime
+            .start_sync_clock(&sandbox.id, sandbox.exit_signal.clone());
         Ok(())
     }
 }

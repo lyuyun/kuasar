@@ -15,38 +15,61 @@ limitations under the License.
 */
 
 use containerd_sandbox::error::Result;
+use log::info;
 
 use crate::{
-    cloud_hypervisor::CloudHypervisorVM, sandbox::KuasarSandbox, utils::get_resources, vm::Hooks,
+    cloud_hypervisor::CloudHypervisorVM,
+    profile::SandboxProfile,
+    sandbox::KuasarSandbox,
+    utils::get_resources,
+    vm::Hooks,
 };
 
-#[derive(Default)]
-pub struct CloudHypervisorHooks {}
+pub struct CloudHypervisorHooks {
+    profile: SandboxProfile,
+}
 
-#[async_trait::async_trait]
-impl Hooks<CloudHypervisorVM> for CloudHypervisorHooks {
-    async fn pre_start(&self, sandbox: &mut KuasarSandbox<CloudHypervisorVM>) -> Result<()> {
-        process_annotation(sandbox).await?;
-        process_config(sandbox).await?;
-        Ok(())
-    }
-
-    async fn post_start(&self, sandbox: &mut KuasarSandbox<CloudHypervisorVM>) -> Result<()> {
-        sandbox.data.task_address = format!("ttrpc+{}", sandbox.vm.agent_socket);
-        // sync clock
-        sandbox.sync_clock().await;
-        Ok(())
+impl CloudHypervisorHooks {
+    pub fn new(profile: SandboxProfile) -> Self {
+        Self { profile }
     }
 }
 
-async fn process_annotation(_sandbox: &mut KuasarSandbox<CloudHypervisorVM>) -> Result<()> {
-    Ok(())
+#[async_trait::async_trait]
+impl Hooks<CloudHypervisorVM> for CloudHypervisorHooks {
+    /// Configure VM resources and, for Standard mode, start virtiofsd before
+    /// the VM boots.
+    async fn pre_start(&self, sandbox: &mut KuasarSandbox<CloudHypervisorVM>) -> Result<()> {
+        process_config(sandbox).await?;
+        if self.profile.needs_virtiofsd() && !sandbox.vm.virtiofsd_config.socket_path.is_empty() {
+            let pid = sandbox.vm.start_virtiofsd().await?;
+            info!(
+                "virtiofsd for sandbox {} started with pid {}",
+                sandbox.id, pid
+            );
+            sandbox.vm.pids.affiliated_pids.push(pid);
+        }
+        Ok(())
+    }
+
+    /// After the VM is running and the guest runtime has completed its
+    /// handshake, set the containerd task address (Standard only) and start
+    /// background clock sync.
+    async fn post_start(&self, sandbox: &mut KuasarSandbox<CloudHypervisorVM>) -> Result<()> {
+        if let Some(addr) = self.profile.task_address(&sandbox.vm.agent_socket) {
+            sandbox.data.task_address = addr;
+            sandbox
+                .runtime
+                .start_sync_clock(&sandbox.id, sandbox.exit_signal.clone());
+        }
+        info!("sandbox {} started (profile: {:?})", sandbox.id, self.profile);
+        Ok(())
+    }
 }
 
 async fn process_config(sandbox: &mut KuasarSandbox<CloudHypervisorVM>) -> Result<()> {
     if let Some(resources) = get_resources(&sandbox.data) {
         if resources.cpu_period > 0 && resources.cpu_quota > 0 {
-            // get ceil of cpus if it is not integer
             let base = (resources.cpu_quota as f64 / resources.cpu_period as f64).ceil();
             sandbox.vm.config.cpus.boot = base as u32;
             sandbox.vm.config.cpus.max = Some(base as u32);
@@ -54,7 +77,6 @@ async fn process_config(sandbox: &mut KuasarSandbox<CloudHypervisorVM>) -> Resul
         if resources.memory_limit_in_bytes > 0 {
             sandbox.vm.config.memory.size = resources.memory_limit_in_bytes as u64;
         }
-        // TODO add other resource limits to vm
     }
     Ok(())
 }
