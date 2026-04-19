@@ -46,6 +46,11 @@ pub enum SandboxProfile {
     /// virtiofsd for shared filesystem access.
     #[default]
     Standard,
+
+    /// Appliance mode: the guest application connects *back* to the host
+    /// over vsock and sends a JSON READY message.  No `vmm-task`, no
+    /// virtiofsd — the guest manages its own filesystem.
+    Appliance,
 }
 
 impl SandboxProfile {
@@ -54,6 +59,7 @@ impl SandboxProfile {
     pub fn runtime_kind(&self) -> RuntimeKind {
         match self {
             Self::Standard => RuntimeKind::VmmTask,
+            Self::Appliance => RuntimeKind::Appliance,
         }
     }
 
@@ -67,6 +73,7 @@ impl SandboxProfile {
     pub fn needs_virtiofsd(&self) -> bool {
         match self {
             Self::Standard => true,
+            Self::Appliance => false,
         }
     }
 
@@ -78,6 +85,7 @@ impl SandboxProfile {
     pub fn task_address(&self, agent_socket: &str) -> Option<String> {
         match self {
             Self::Standard => Some(format!("ttrpc+{}", agent_socket)),
+            Self::Appliance => None,
         }
     }
 }

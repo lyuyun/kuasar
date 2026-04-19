@@ -37,16 +37,6 @@ impl CloudHypervisorHooks {
 
 #[async_trait::async_trait]
 impl Hooks<CloudHypervisorVM> for CloudHypervisorHooks {
-    /// Inject the profile-appropriate [`GuestRuntime`], replacing the default
-    /// `VmmTaskRuntime` set at sandbox construction time.
-    ///
-    /// [`GuestRuntime`]: crate::guest_runtime::GuestRuntime
-    async fn post_create(&self, sandbox: &mut KuasarSandbox<CloudHypervisorVM>) -> Result<()> {
-        sandbox.runtime_kind = self.profile.runtime_kind();
-        sandbox.runtime = Some(self.profile.create_runtime(&sandbox.id));
-        Ok(())
-    }
-
     /// Configure VM resources and, for Standard mode, start virtiofsd before
     /// the VM boots.
     async fn pre_start(&self, sandbox: &mut KuasarSandbox<CloudHypervisorVM>) -> Result<()> {
@@ -68,7 +58,9 @@ impl Hooks<CloudHypervisorVM> for CloudHypervisorHooks {
     async fn post_start(&self, sandbox: &mut KuasarSandbox<CloudHypervisorVM>) -> Result<()> {
         if let Some(addr) = self.profile.task_address(&sandbox.vm.agent_socket) {
             sandbox.data.task_address = addr;
-            sandbox.start_clock_sync();
+            sandbox
+                .runtime
+                .start_sync_clock(&sandbox.id, sandbox.exit_signal.clone());
         }
         info!("sandbox {} started (profile: {:?})", sandbox.id, self.profile);
         Ok(())
