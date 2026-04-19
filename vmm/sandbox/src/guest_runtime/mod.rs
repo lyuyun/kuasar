@@ -21,11 +21,16 @@ limitations under the License.
 //!
 //! - `VmmTaskRuntime`: connects to `vmm-task` via ttrpc over vsock, polls for readiness
 //!   with `check()`, then calls `setup_sandbox()` to configure the guest network.
+//!
+//! - `ApplianceRuntime`: listens on a host-side vsock server and waits for a JSON Lines
+//!   `{"type":"READY"}` message pushed by the in-guest init process.
 
+pub mod appliance;
 pub mod vmm_task;
 
 use std::sync::Arc;
 
+pub use appliance::ApplianceRuntime;
 use async_trait::async_trait;
 use containerd_sandbox::{data::SandboxData, error::Result, signal::ExitSignal};
 use serde::{Deserialize, Serialize};
@@ -44,6 +49,8 @@ pub enum RuntimeKind {
     /// communicates with `vmm-task` via ttrpc over vsock.
     #[default]
     VmmTask,
+    /// guest connects to host over vsock and sends a READY message.
+    Appliance,
 }
 
 impl RuntimeKind {
@@ -52,9 +59,10 @@ impl RuntimeKind {
     /// Single source of truth for the `RuntimeKind → GuestRuntime` mapping, used
     /// by both the initial create path (via `SandboxProfile::create_runtime`) and
     /// the recovery path.
-    pub fn create_runtime(&self, _sandbox_id: &str) -> Box<dyn GuestRuntime> {
+    pub fn create_runtime(&self, sandbox_id: &str) -> Box<dyn GuestRuntime> {
         match self {
             Self::VmmTask => Box::new(VmmTaskRuntime::new()),
+            Self::Appliance => Box::new(ApplianceRuntime::new(sandbox_id)),
         }
     }
 }
