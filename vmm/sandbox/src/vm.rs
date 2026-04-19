@@ -35,8 +35,6 @@ const VIRTIO_9P: &str = "virtio-9p";
 #[async_trait]
 pub trait VMFactory {
     type VM: VM + Sync + Send;
-    type Config: Sync + Send;
-    fn new(config: Self::Config) -> Self;
     async fn create_vm(&self, id: &str, s: &SandboxOption) -> Result<Self::VM>;
 }
 
@@ -61,13 +59,16 @@ pub trait Hooks<V: VM + Sync + Send> {
 
 #[async_trait]
 pub trait VM: Serialize + Sync + Send {
-    async fn start(&mut self) -> Result<u32>;
+    /// Boot the VMM process. Must NOT start virtiofsd or any other auxiliary daemon;
+    /// those are started by `Hooks::pre_start()` before this is called.
+    async fn boot(&mut self) -> Result<u32>;
     async fn stop(&mut self, force: bool) -> Result<()>;
     async fn attach(&mut self, device_info: DeviceInfo) -> Result<()>;
     async fn hot_attach(&mut self, device_info: DeviceInfo) -> Result<(BusType, String)>;
     async fn hot_detach(&mut self, id: &str) -> Result<()>;
     async fn ping(&self) -> Result<()>;
-    fn socket_address(&self) -> String;
+    /// Return the vsock socket file path (without protocol prefix).
+    fn vsock_path(&self) -> String;
     async fn wait_channel(&self) -> Option<Receiver<(u32, i128)>>;
     async fn vcpus(&self) -> Result<VcpuThreads>;
     fn pids(&self) -> Pids;

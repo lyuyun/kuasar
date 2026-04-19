@@ -46,7 +46,7 @@ async fn main() {
 
     let mut sandboxer: KuasarSandboxer<StratoVirtVMFactory, StratoVirtHooks> = KuasarSandboxer::new(
         config.sandbox,
-        config.hypervisor.clone(),
+        StratoVirtVMFactory::new(config.hypervisor.clone()),
         StratoVirtHooks::new(config.hypervisor),
     );
 
