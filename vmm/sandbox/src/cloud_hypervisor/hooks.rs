@@ -15,26 +15,50 @@ limitations under the License.
 */
 
 use containerd_sandbox::error::Result;
+use log::info;
 
 use crate::{
-    cloud_hypervisor::CloudHypervisorVM, sandbox::KuasarSandbox, utils::get_resources, vm::Hooks,
+    cloud_hypervisor::CloudHypervisorVM, profile::SandboxProfile, sandbox::KuasarSandbox,
+    utils::get_resources, vm::Hooks,
 };
 
-#[derive(Default)]
-pub struct CloudHypervisorHooks {}
+pub struct CloudHypervisorHooks {
+    profile: SandboxProfile,
+}
+
+impl CloudHypervisorHooks {
+    pub fn new(profile: SandboxProfile) -> Self {
+        Self { profile }
+    }
+}
 
 #[async_trait::async_trait]
 impl Hooks<CloudHypervisorVM> for CloudHypervisorHooks {
+    /// Configure VM resources and start virtiofsd before the VM boots.
     async fn pre_start(&self, sandbox: &mut KuasarSandbox<CloudHypervisorVM>) -> Result<()> {
         process_annotation(sandbox).await?;
         process_config(sandbox).await?;
+        if self.profile.needs_virtiofsd() && !sandbox.vm.virtiofsd_config.socket_path.is_empty() {
+            let pid = sandbox.vm.start_virtiofsd().await?;
+            info!(
+                "virtiofsd for sandbox {} started with pid {}",
+                sandbox.id, pid
+            );
+            sandbox.vm.pids.affiliated_pids.push(pid);
+        }
         Ok(())
     }
 
+    /// After the VM is running and the guest runtime has completed its
+    /// handshake, set the containerd task address and start background clock sync.
     async fn post_start(&self, sandbox: &mut KuasarSandbox<CloudHypervisorVM>) -> Result<()> {
-        sandbox.data.task_address = format!("ttrpc+{}", sandbox.vm.agent_socket);
-        // sync clock
-        sandbox.sync_clock().await;
+        if let Some(addr) = self.profile.task_address(&sandbox.vm.agent_socket) {
+            sandbox.data.task_address = addr;
+        }
+        info!(
+            "sandbox {} started (profile: {:?})",
+            sandbox.id, self.profile
+        );
         Ok(())
     }
 }

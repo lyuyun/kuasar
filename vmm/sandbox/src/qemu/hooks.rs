@@ -16,6 +16,7 @@ limitations under the License.
 
 use async_trait::async_trait;
 use containerd_sandbox::error::Result;
+use log::info;
 
 use crate::{
     qemu::{config::QemuVMConfig, QemuVM},
@@ -40,13 +41,20 @@ impl Hooks<QemuVM> for QemuHooks {
     async fn pre_start(&self, sandbox: &mut KuasarSandbox<QemuVM>) -> Result<()> {
         process_annotation(sandbox).await?;
         process_config(sandbox).await?;
+        // Start virtiofsd before booting the VM.
+        if sandbox.vm.virtiofsd_config.is_some() {
+            let pid = sandbox.vm.start_virtiofsd().await?;
+            info!(
+                "virtiofsd for sandbox {} started with pid {}",
+                sandbox.id, pid
+            );
+            sandbox.vm.pids.affiliated_pids.push(pid);
+        }
         Ok(())
     }
 
     async fn post_start(&self, sandbox: &mut KuasarSandbox<QemuVM>) -> Result<()> {
         sandbox.data.task_address = format!("ttrpc+{}", sandbox.vm.agent_socket);
-        // sync clock
-        sandbox.sync_clock().await;
         Ok(())
     }
 }

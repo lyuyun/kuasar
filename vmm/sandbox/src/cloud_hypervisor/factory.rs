@@ -22,22 +22,25 @@ use crate::{
         devices::{console::Console, fs::Fs, pmem::Pmem, rng::Rng, vsock::Vsock},
         CloudHypervisorVM,
     },
+    profile::SandboxProfile,
     utils::get_netns,
     vm::VMFactory,
 };
 
 pub struct CloudHypervisorVMFactory {
     vm_config: CloudHypervisorVMConfig,
+    profile: SandboxProfile,
+}
+
+impl CloudHypervisorVMFactory {
+    pub fn new(vm_config: CloudHypervisorVMConfig, profile: SandboxProfile) -> Self {
+        Self { vm_config, profile }
+    }
 }
 
 #[async_trait::async_trait]
 impl VMFactory for CloudHypervisorVMFactory {
     type VM = CloudHypervisorVM;
-    type Config = CloudHypervisorVMConfig;
-
-    fn new(config: Self::Config) -> Self {
-        Self { vm_config: config }
-    }
 
     async fn create_vm(
         &self,
@@ -46,6 +49,7 @@ impl VMFactory for CloudHypervisorVMFactory {
     ) -> containerd_sandbox::error::Result<Self::VM> {
         let netns = get_netns(&s.sandbox);
         let mut vm = CloudHypervisorVM::new(id, &netns, &s.base_dir, &self.vm_config);
+
         // add image as a disk
         if !self.vm_config.common.image_path.is_empty() {
             let rootfs_device = Pmem::new("rootfs", &self.vm_config.common.image_path, true);
@@ -58,13 +62,16 @@ impl VMFactory for CloudHypervisorVMFactory {
             vm.add_device(rng);
         }
 
-        // add vsock device
+        // add vsock device; host connects to guest vmm-task via hvsock
         // set guest cid
         // cid seems not important for cloud hypervisor
-        let guest_socket_path = format!("{}/task.vsock", s.base_dir);
-        let vsock = Vsock::new(3, &guest_socket_path, "vsock");
+        let vsock_socket_path = format!("{}/task.vsock", s.base_dir);
+        let vsock = Vsock::new(3, &vsock_socket_path, "vsock");
         vm.add_device(vsock);
-        vm.agent_socket = format!("hvsock://{}:1024", guest_socket_path);
+
+        vm.agent_socket = match &self.profile {
+            SandboxProfile::Standard => format!("hvsock://{}:1024", vsock_socket_path),
+        };
 
         // add console device
         // TODO add log path parameter
@@ -72,8 +79,8 @@ impl VMFactory for CloudHypervisorVMFactory {
         let console = Console::new(&console_path, "console");
         vm.add_device(console);
 
-        // add virtio-fs device
-        if !vm.virtiofsd_config.socket_path.is_empty() {
+        // add virtio-fs device (skipped when profile does not need virtiofsd)
+        if self.profile.needs_virtiofsd() && !vm.virtiofsd_config.socket_path.is_empty() {
             let fs = Fs::new("fs", &vm.virtiofsd_config.socket_path, "kuasar");
             vm.add_device(fs);
         }
