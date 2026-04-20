@@ -163,6 +163,177 @@ mod integration_tests {
     }
 }
 
+/// Appliance mode tests.
+///
+/// These tests verify the appliance protocol and framework configuration without
+/// requiring a running VM or guest.  They can be run with `make test-e2e-framework`.
+#[cfg(test)]
+mod appliance_tests {
+    use super::*;
+    use std::time::Duration;
+    use tokio::{
+        io::AsyncWriteExt,
+        net::UnixStream,
+        time::timeout,
+    };
+
+    fn unique_socket_path() -> String {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        format!("/tmp/kuasar-e2e-appliance-{}.sock", nanos)
+    }
+
+    /// Verify the e2e framework can be configured with an appliance socket entry
+    /// and that `get_runtime_config` returns the expected socket path.
+    #[tokio::test]
+    async fn test_appliance_runtime_config_entry() {
+        let mut config = E2EConfig::default();
+        config.sockets.insert(
+            "vmm-appliance".to_string(),
+            "/run/kuasar-vmm-appliance.sock".to_string(),
+        );
+
+        let ctx = E2EContext::new_with_config(config)
+            .await
+            .expect("Should create context");
+
+        let runtime_config = ctx
+            .get_runtime_config("vmm-appliance")
+            .expect("Should get vmm-appliance config");
+
+        assert_eq!(
+            runtime_config.socket_path,
+            "/run/kuasar-vmm-appliance.sock"
+        );
+        assert_eq!(runtime_config.name, "vmm-appliance");
+    }
+
+    /// Documents the wire format of the READY message that `ApplianceRuntime`
+    /// expects: a JSON Lines object with `type == "READY"` and a matching
+    /// `sandbox_id`.  This test exercises the raw socket protocol rather than
+    /// calling `ApplianceRuntime` directly; see `vmm/sandbox` unit tests for
+    /// tests that call `wait_ready` end-to-end.
+    #[tokio::test]
+    async fn test_appliance_wire_format_ready_message() {
+        let socket_path = unique_socket_path();
+
+        // Act as the host-side listener.
+        let listener = tokio::net::UnixListener::bind(&socket_path)
+            .expect("Should bind Unix socket");
+
+        // Spawn a "guest" that sends a valid READY message.
+        let path_clone = socket_path.clone();
+        let sandbox_id = "e2e-sb-001";
+        let msg = format!(r#"{{"type":"READY","sandbox_id":"{}"}}"#, sandbox_id);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let mut stream = UnixStream::connect(&path_clone)
+                .await
+                .expect("guest: connect failed");
+            stream
+                .write_all(format!("{}\n", msg).as_bytes())
+                .await
+                .expect("guest: write failed");
+        });
+
+        // Host accepts and reads the READY message.
+        let (stream, _) = timeout(Duration::from_secs(2), listener.accept())
+            .await
+            .expect("accept timed out")
+            .expect("accept failed");
+
+        use tokio::io::AsyncBufReadExt;
+        let mut reader = tokio::io::BufReader::new(stream);
+        let mut line = String::new();
+        reader
+            .read_line(&mut line)
+            .await
+            .expect("read_line failed");
+
+        let msg: serde_json::Value =
+            serde_json::from_str(line.trim_end()).expect("Should parse JSON");
+        assert_eq!(msg["type"].as_str().unwrap(), "READY");
+        assert_eq!(msg["sandbox_id"].as_str().unwrap(), sandbox_id);
+
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
+    /// Documents the wire format of the FATAL message that `ApplianceRuntime`
+    /// must handle: a JSON Lines object with `type == "FATAL"` and a `reason`
+    /// field.  This test exercises the raw socket protocol rather than calling
+    /// `ApplianceRuntime` directly; see `vmm/sandbox` unit tests for tests that
+    /// call `wait_ready` with a FATAL response.
+    #[tokio::test]
+    async fn test_appliance_wire_format_fatal_message() {
+        let socket_path = unique_socket_path();
+        let listener = tokio::net::UnixListener::bind(&socket_path)
+            .expect("Should bind Unix socket");
+
+        let path_clone = socket_path.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let mut stream = UnixStream::connect(&path_clone)
+                .await
+                .expect("guest: connect failed");
+            let msg = r#"{"type":"FATAL","reason":"init.d hook failed"}"#;
+            stream
+                .write_all(format!("{}\n", msg).as_bytes())
+                .await
+                .expect("guest: write failed");
+        });
+
+        let (stream, _) = timeout(Duration::from_secs(2), listener.accept())
+            .await
+            .expect("accept timed out")
+            .expect("accept failed");
+
+        use tokio::io::AsyncBufReadExt;
+        let mut reader = tokio::io::BufReader::new(stream);
+        let mut line = String::new();
+        reader.read_line(&mut line).await.expect("read_line failed");
+
+        let msg: serde_json::Value =
+            serde_json::from_str(line.trim_end()).expect("Should parse JSON");
+        assert_eq!(msg["type"].as_str().unwrap(), "FATAL");
+        assert!(
+            msg["reason"].as_str().is_some(),
+            "FATAL message must include a reason field"
+        );
+
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
+    /// Verify that no service is running for vmm-appliance when none was started.
+    #[tokio::test]
+    async fn test_appliance_service_not_started() {
+        let mut config = E2EConfig::default();
+        config.sockets.insert(
+            "vmm-appliance".to_string(),
+            "/run/kuasar-vmm-appliance.sock".to_string(),
+        );
+        let ctx = E2EContext::new_with_config(config)
+            .await
+            .expect("Should create context");
+
+        // Ensure socket doesn't exist from a prior run.
+        let _ = std::fs::remove_file("/run/kuasar-vmm-appliance.sock");
+
+        let result = timeout(Duration::from_secs(5), ctx.test_runtime("vmm-appliance"))
+            .await
+            .expect("Should complete within timeout")
+            .expect("Should not panic");
+
+        assert!(
+            !result.success,
+            "Test must fail when appliance service is not running"
+        );
+        assert!(result.error.is_some(), "Error should be reported");
+    }
+}
+
 #[cfg(test)]
 mod error_handling_tests {
     use super::*;

@@ -52,6 +52,11 @@ use crate::{
 
 pub const KUASAR_GUEST_SHARE_DIR: &str = "/run/kuasar/storage/containers/";
 
+/// Grace period given to the guest to cleanly shut down its workload before the
+/// hypervisor is killed.  Ten seconds is enough for most SIGTERM handlers while
+/// keeping total sandbox teardown under a containerd timeout.
+const DEFAULT_SHUTDOWN_DEADLINE_MS: u64 = 10_000;
+
 /// Serde default for `KuasarSandbox::runtime`.
 ///
 /// Deserialized sandboxes always have their runtime rebuilt in `recover()` before
@@ -190,6 +195,15 @@ where
                 let _ = sandbox_cgroups.remove_sandbox_cgroups();
                 return Err(e);
             }
+        }
+        if matches!(self.config.profile, SandboxProfile::Appliance)
+            && !self.factory.supports_appliance_mode()
+        {
+            return Err(anyhow!(
+                "Appliance mode is not supported by this hypervisor; \
+                 only Cloud Hypervisor implements the Appliance profile"
+            )
+            .into());
         }
         let vm = self.factory.create_vm(id, &s).await?;
         let profile = &self.config.profile;
@@ -354,6 +368,13 @@ where
 
     #[instrument(skip_all)]
     async fn append_container(&mut self, id: &str, options: ContainerOption) -> Result<()> {
+        if matches!(self.runtime_kind, RuntimeKind::Appliance) {
+            return Err(anyhow!(
+                "container operations are not supported in Appliance mode; \
+                 the workload is managed entirely within the VM image"
+            )
+            .into());
+        }
         let handler_chain = self.container_append_handlers(id, options)?;
         handler_chain.handle(self).await?;
         self.dump().await?;
@@ -362,6 +383,13 @@ where
 
     #[instrument(skip_all)]
     async fn update_container(&mut self, id: &str, options: ContainerOption) -> Result<()> {
+        if matches!(self.runtime_kind, RuntimeKind::Appliance) {
+            return Err(anyhow!(
+                "container operations are not supported in Appliance mode; \
+                 the workload is managed entirely within the VM image"
+            )
+            .into());
+        }
         let handler_chain = self.container_update_handlers(id, options).await?;
         handler_chain.handle(self).await?;
         self.dump().await?;
@@ -542,6 +570,9 @@ where
             }
         }
 
+        if let Err(e) = self.runtime.shutdown(DEFAULT_SHUTDOWN_DEADLINE_MS).await {
+            warn!("sandbox {}: runtime shutdown error: {}", self.id, e);
+        }
         self.vm.stop(force).await?;
         self.destroy_network().await;
         Ok(())
@@ -562,6 +593,9 @@ where
 
     #[instrument(skip_all)]
     async fn setup_sandbox_files(&self) -> Result<()> {
+        if matches!(self.runtime_kind, RuntimeKind::Appliance) {
+            return Ok(());
+        }
         let shared_path = self.get_sandbox_shared_path();
         create_dir_all(&shared_path)
             .await

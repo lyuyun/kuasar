@@ -49,6 +49,10 @@ async fn main() {
             "kuasar-vmm-sandboxer-clh-service",
             "kuasar-vmm-sandboxer-clh",
         ),
+        SandboxProfile::Appliance => (
+            "kuasar-vmm-sandboxer-clh-appliance-service",
+            "kuasar-vmm-sandboxer-clh-appliance",
+        ),
     };
 
     trace::setup_tracing(&log_level, service_name).unwrap();

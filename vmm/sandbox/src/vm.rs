@@ -36,6 +36,15 @@ const VIRTIO_9P: &str = "virtio-9p";
 pub trait VMFactory {
     type VM: VM + Sync + Send;
     async fn create_vm(&self, id: &str, s: &SandboxOption) -> Result<Self::VM>;
+
+    /// Whether this factory supports Appliance mode sandboxes.
+    ///
+    /// Defaults to `false`; only `CloudHypervisorVMFactory` overrides this to
+    /// `true`.  `KuasarSandboxer::create` rejects an Appliance-profile config
+    /// for any factory that returns `false` here.
+    fn supports_appliance_mode(&self) -> bool {
+        false
+    }
 }
 
 #[async_trait]

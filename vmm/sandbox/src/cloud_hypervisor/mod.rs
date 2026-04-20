@@ -42,6 +42,7 @@ use crate::{
     },
     device::{BusType, DeviceInfo},
     param::ToCmdLineParams,
+    profile::SandboxProfile,
     utils::{read_std, set_cmd_fd, set_cmd_netns, wait_channel, wait_pid, write_file_atomic},
     vm::{Pids, VcpuThreads, VM},
 };
@@ -74,8 +75,14 @@ pub struct CloudHypervisorVM {
 }
 
 impl CloudHypervisorVM {
-    pub fn new(id: &str, netns: &str, base_dir: &str, vm_config: &CloudHypervisorVMConfig) -> Self {
-        let mut config = CloudHypervisorConfig::from(vm_config);
+    pub fn new(
+        id: &str,
+        netns: &str,
+        base_dir: &str,
+        vm_config: &CloudHypervisorVMConfig,
+        profile: &SandboxProfile,
+    ) -> Self {
+        let mut config = CloudHypervisorConfig::from(vm_config, profile);
         config.api_socket = format!("{}/api.sock", base_dir);
         if !vm_config.common.initrd_path.is_empty() {
             config.initramfs = Some(vm_config.common.initrd_path.clone());

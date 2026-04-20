@@ -114,6 +114,63 @@ path = \"/usr/local/bin/mock-hypervisor\"
     }
 
     #[tokio::test]
+    async fn test_config_load_with_appliance_profile() {
+        use crate::profile::SandboxProfile;
+
+        let tmp_dir = TempDir::new().unwrap();
+        let tmp_path = Path::join(tmp_dir.path(), "config_clh_appliance.toml");
+
+        let toml_str = r#"
+[sandbox]
+log_level = "info"
+enable_tracing = false
+profile = "appliance"
+[hypervisor]
+path = "/usr/local/bin/mock-hypervisor"
+"#;
+        write_str_to_file(tmp_path.as_path(), toml_str)
+            .await
+            .unwrap();
+
+        let config: Config<MockHypervisor> = Config::load_config(tmp_path.to_str().unwrap())
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(config.sandbox.profile, SandboxProfile::Appliance),
+            "profile = \"appliance\" in TOML must deserialise to SandboxProfile::Appliance"
+        );
+        assert_eq!(config.sandbox.log_level, "info");
+    }
+
+    #[tokio::test]
+    async fn test_config_load_profile_defaults_to_standard_when_absent() {
+        use crate::profile::SandboxProfile;
+
+        let tmp_dir = TempDir::new().unwrap();
+        let tmp_path = Path::join(tmp_dir.path(), "config_clh.toml");
+
+        let toml_str = r#"
+[sandbox]
+log_level = "debug"
+[hypervisor]
+path = "/usr/local/bin/mock-hypervisor"
+"#;
+        write_str_to_file(tmp_path.as_path(), toml_str)
+            .await
+            .unwrap();
+
+        let config: Config<MockHypervisor> = Config::load_config(tmp_path.to_str().unwrap())
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(config.sandbox.profile, SandboxProfile::Standard),
+            "absent profile field must default to SandboxProfile::Standard"
+        );
+    }
+
+    #[tokio::test]
     async fn test_config_load_with_wrong_config() {
         let tmp_dir = TempDir::new().unwrap();
         let tmp_path = Path::join(tmp_dir.path(), "config_clh.toml");

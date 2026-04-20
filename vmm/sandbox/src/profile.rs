@@ -33,6 +33,32 @@ use serde::{Deserialize, Serialize};
 
 use crate::guest_runtime::{GuestRuntime, RuntimeKind};
 
+/// Pod annotation key that specifies the erofs VM disk image path for an Appliance-mode sandbox.
+///
+/// **Workaround**: set this to the absolute local path of the pre-staged erofs image.
+/// Future versions will resolve this automatically from the containerd snapshot store
+/// via `ContainerData.rootfs` when `CreateContainer` is called.
+///
+/// ```yaml
+/// annotations:
+///   io.kuasar.appliance.image: /var/lib/kuasar/appliance/myapp.erofs
+/// ```
+pub const ANNOTATION_APPLIANCE_IMAGE: &str = "io.kuasar.appliance.image";
+
+/// Pod annotation key that specifies the application executable path for an Appliance-mode sandbox.
+///
+/// The value is passed to the guest as the `KUASAR_APP` kernel cmdline parameter and
+/// read by `kuasar-init` to fork+exec the workload process.  Arguments may be appended
+/// space-separated, but each argument must not contain spaces (kernel cmdline limitation).
+///
+/// Falls back to `appliance_app` in the hypervisor TOML config when absent.
+///
+/// ```yaml
+/// annotations:
+///   io.kuasar.appliance.app: /usr/bin/myapp
+/// ```
+pub const ANNOTATION_APPLIANCE_APP: &str = "io.kuasar.appliance.app";
+
 /// Selects the guest coordination protocol and device topology for a sandbox.
 ///
 /// Persisted in the `[sandbox]` section of the hypervisor TOML config under
@@ -46,6 +72,11 @@ pub enum SandboxProfile {
     /// virtiofsd for shared filesystem access.
     #[default]
     Standard,
+
+    /// Appliance mode: the guest application connects *back* to the host
+    /// over vsock and sends a JSON READY message.  No `vmm-task`, no
+    /// virtiofsd — the guest manages its own filesystem.
+    Appliance,
 }
 
 impl SandboxProfile {
@@ -54,6 +85,7 @@ impl SandboxProfile {
     pub fn runtime_kind(&self) -> RuntimeKind {
         match self {
             Self::Standard => RuntimeKind::VmmTask,
+            Self::Appliance => RuntimeKind::Appliance,
         }
     }
 
@@ -67,6 +99,7 @@ impl SandboxProfile {
     pub fn needs_virtiofsd(&self) -> bool {
         match self {
             Self::Standard => true,
+            Self::Appliance => false,
         }
     }
 
@@ -78,6 +111,7 @@ impl SandboxProfile {
     pub fn task_address(&self, agent_socket: &str) -> Option<String> {
         match self {
             Self::Standard => Some(format!("ttrpc+{}", agent_socket)),
+            Self::Appliance => None,
         }
     }
 }
