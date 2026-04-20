@@ -33,6 +33,25 @@ make_vmm_task() {
     popd
 }
 
+make_kuasar_init() {
+    local repo_dir="$1"
+
+    yum install -y cmake make gcc wget musl-libc-static
+
+    # update cert file under internal proxy scenario
+    if [ -f "${cert_file_path}" ]; then
+        cp ${cert_file_path} /etc/pki/ca-trust/source/anchors/
+        update-ca-trust extract
+    fi
+
+    pushd ${repo_dir}
+
+    source vmm/scripts/image/install_rust.sh
+
+    make bin/kuasar-init ARCH=${ARCH}
+    popd
+}
+
 install_golang() {
     pushd /home/
     arch_name=""
@@ -75,7 +94,8 @@ create_tmp_rootfs() {
         ${rootfs_dir}/proc \
         ${rootfs_dir}/etc \
         ${rootfs_dir}/run \
-        ${rootfs_dir}/var
+        ${rootfs_dir}/var \
+        ${rootfs_dir}/mnt
 
     ln -s ../run ${rootfs_dir}/var/run
     touch ${rootfs_dir}/etc/resolv.conf

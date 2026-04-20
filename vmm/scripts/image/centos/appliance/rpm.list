@@ -1,0 +1,14 @@
+# Minimal RPM packages for Appliance Mode rootfs.
+# Excludes container runtime packages (runc, cni-plugins) that the standard
+# centos image includes — appliance VMs run a single user application, not
+# OCI containers.
+bash
+coreutils
+iproute
+iputils
+curl
+ca-certificates
+python3
+net-tools
+procps-ng
+# End of file, do not delete

@@ -21,8 +21,9 @@ endif
 
 .PHONY: vmm wasm quark clean all install-vmm install-wasm install-quark install \
         bin/vmm-sandboxer bin/vmm-task bin/vmlinux.bin bin/kuasar.img bin/kuasar.initrd \
+        bin/kuasar-init bin/kuasar-appliance.img \
         bin/wasm-sandboxer bin/quark-sandboxer bin/runc-sandboxer \
-        test-e2e test-e2e-framework verify-e2e local-up clean-e2e help
+        test-e2e test-e2e-framework verify-e2e local-up clean-e2e test-init help
 
 all: vmm quark wasm
 
@@ -33,6 +34,10 @@ bin/vmm-sandboxer:
 bin/vmm-task:
 	@cd vmm/task && cargo build --release --target=${ARCH}-unknown-linux-musl --features=${VMM_TASK_FEATURES}
 	@mkdir -p bin && cp target/${ARCH}-unknown-linux-musl/release/vmm-task bin/vmm-task
+
+bin/kuasar-init:
+	@cargo build --release -p kuasar-init --target=${ARCH}-unknown-linux-musl
+	@mkdir -p bin && cp target/${ARCH}-unknown-linux-musl/release/kuasar-init bin/kuasar-init
 
 bin/vmlinux.bin:
 	@bash vmm/scripts/kernel/${HYPERVISOR}/build.sh ${KERNEL_VERSION}
@@ -45,6 +50,10 @@ bin/kuasar.img:
 bin/kuasar.initrd:
 	@bash vmm/scripts/image/build.sh initrd ${GUESTOS_IMAGE}
 	@mkdir -p bin && cp /tmp/kuasar.initrd bin/kuasar.initrd && rm /tmp/kuasar.initrd
+
+bin/kuasar-appliance.img:
+	@bash vmm/scripts/image/build.sh image ${GUESTOS_IMAGE}/appliance
+	@mkdir -p bin && cp /tmp/kuasar.img bin/kuasar-appliance.img && rm /tmp/kuasar.img
 
 bin/wasm-sandboxer:
 	@cd wasm && cargo build --release --features=${WASM_RUNTIME}
@@ -69,6 +78,9 @@ else
 vmm: bin/vmm-sandboxer bin/kuasar.initrd bin/vmlinux.bin
 endif
 
+test-init: ## Run kuasar-init unit tests (no service startup required)
+	@cargo test -p kuasar-init
+
 clean:
 	@rm -rf bin
 	@cd vmm/sandbox && cargo clean
@@ -76,6 +88,7 @@ clean:
 	@cd wasm && cargo clean
 	@cd quark && cargo clean
 	@cd runc && cargo clean
+	@cargo clean -p kuasar-init
 
 install-vmm:
 	@install -d -m 750 ${DEST_DIR}${BIN_DIR}

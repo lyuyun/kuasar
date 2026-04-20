@@ -1,0 +1,22 @@
+[package]
+name = "kuasar-init"
+version = "0.1.0"
+license = "Apache-2.0"
+edition = "2021"
+
+[[bin]]
+name = "kuasar-init"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { version = "1.0", default-features = false, features = ["std"] }
+nix = { version = "0.28.0", features = ["fs", "hostname", "mount", "reboot", "signal", "process"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.17.0", features = ["full"] }
+tokio-vsock = "0.3.1"
+log = "0.4"
+env_logger = "0.10"
+
+[dev-dependencies]
+tempfile = "3.0"

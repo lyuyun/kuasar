@@ -2074,6 +2074,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "kuasar-init"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "env_logger 0.10.2",
+ "log",
+ "nix 0.28.0",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-vsock",
+]
+
+[[package]]
 name = "lazy_static"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

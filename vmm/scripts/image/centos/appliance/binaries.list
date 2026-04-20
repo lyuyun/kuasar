@@ -1,0 +1,23 @@
+# Binaries to copy into the appliance rootfs.
+# Format: <source-path> <destination-dir-in-rootfs>
+# Intentionally minimal — no runc, no container runtime tools.
+/usr/bin/bash /bin
+/usr/bin/sh /bin
+/usr/bin/ls /bin
+/usr/bin/cat /bin
+/usr/bin/cp /bin
+/usr/bin/mv /bin
+/usr/bin/rm /bin
+/usr/bin/mkdir /bin
+/usr/bin/find /bin
+/usr/bin/grep /bin
+/usr/bin/chmod /bin
+/usr/bin/chown /bin
+/usr/bin/echo /bin
+/usr/bin/ps /bin
+/usr/bin/kill /bin
+/usr/bin/curl /bin
+/usr/sbin/ip /sbin
+/usr/bin/ping /bin
+/usr/bin/python3 /bin
+# End of file, do not delete

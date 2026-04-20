@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "vmm/task",
+    "vmm/init",
     "vmm/sandbox",
     "vmm/common",
     "runc",

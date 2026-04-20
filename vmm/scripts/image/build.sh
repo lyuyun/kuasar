@@ -110,8 +110,21 @@ fi
 
 case "$1" in
 image)
-	bash ${REPO_DIR}/vmm/scripts/image/build_image.sh
-	fn_check_result $? "build image failed!"
+	# Appliance images are flat (no partition table); the kernel cmdline uses
+	# root=/dev/pmem0.  Standard mode uses build_image.sh (GPT+DAX layout,
+	# root=/dev/pmem0p1).
+	if [[ "${GUESTOS_IMAGE}" == */appliance* ]] && [[ "${FS_TYPE:-ext4}" == "erofs" ]]; then
+		IMAGE="${IMAGE:-/tmp/kuasar.erofs}" \
+		bash ${REPO_DIR}/vmm/scripts/image/build_erofs_image.sh
+		fn_check_result $? "build erofs image failed!"
+	elif [[ "${GUESTOS_IMAGE}" == */appliance* ]]; then
+		# Appliance ext4: flat image, root=/dev/pmem0.
+		bash ${REPO_DIR}/vmm/scripts/image/build_ext4_flat_image.sh
+		fn_check_result $? "build ext4 flat image failed!"
+	else
+		bash ${REPO_DIR}/vmm/scripts/image/build_image.sh
+		fn_check_result $? "build image failed!"
+	fi
 	;;
 initrd)
 	initrd=${INITRD:-"/tmp/kuasar.initrd"}
