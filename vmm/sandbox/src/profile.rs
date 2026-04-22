@@ -47,17 +47,53 @@ pub const ANNOTATION_APPLIANCE_IMAGE: &str = "io.kuasar.appliance.image";
 
 /// Pod annotation key that specifies the application executable path for an Appliance-mode sandbox.
 ///
-/// The value is passed to the guest as the `KUASAR_APP` kernel cmdline parameter and
-/// read by `kuasar-init` to fork+exec the workload process.  Arguments may be appended
-/// space-separated, but each argument must not contain spaces (kernel cmdline limitation).
-///
-/// Falls back to `appliance_app` in the hypervisor TOML config when absent.
+/// Delivered to the guest via the `BOOTSTRAP` vsock message (not via kernel cmdline),
+/// so paths with spaces are supported.  Falls back to `appliance_app` in the
+/// hypervisor TOML config when absent.
 ///
 /// ```yaml
 /// annotations:
 ///   io.kuasar.appliance.app: /usr/bin/myapp
 /// ```
 pub const ANNOTATION_APPLIANCE_APP: &str = "io.kuasar.appliance.app";
+
+/// Pod annotation key for additional command-line arguments of the workload.
+///
+/// Value must be a JSON array of strings.  Arguments may contain spaces and
+/// special characters because they are delivered via BOOTSTRAP, not cmdline.
+///
+/// ```yaml
+/// annotations:
+///   io.kuasar.appliance.args: '["--port","8080","--name","my server"]'
+/// ```
+pub const ANNOTATION_APPLIANCE_ARGS: &str = "io.kuasar.appliance.args";
+
+/// Annotation key prefix for workload environment variables.
+///
+/// Any annotation whose key starts with this prefix is passed as an environment
+/// variable to the workload.  The key suffix becomes the variable name; the
+/// annotation value becomes the variable value.  Values may contain any characters
+/// (spaces, `=`, quotes, …) because they travel over vsock BOOTSTRAP, not cmdline.
+///
+/// ```yaml
+/// annotations:
+///   io.kuasar.appliance.env.MY_VAR: "value with spaces and = signs"
+///   io.kuasar.appliance.env.SECRET_KEY: "s3cr3t!"
+/// ```
+pub const ANNOTATION_APPLIANCE_ENV_PREFIX: &str = "io.kuasar.appliance.env.";
+
+/// Pod annotation key for the heartbeat interval (milliseconds).
+///
+/// Overrides the guest default of 10 000 ms.  Set to `"0"` to disable heartbeats.
+pub const ANNOTATION_APPLIANCE_HEARTBEAT_MS: &str = "io.kuasar.appliance.heartbeat_ms";
+
+/// Pod annotation key for the readiness probe specification.
+///
+/// Forwarded verbatim to `ReadinessCheck::from_cmdline` inside the guest.
+pub const ANNOTATION_APPLIANCE_READY_CHECK: &str = "io.kuasar.appliance.ready_check";
+
+/// Pod annotation key for the readiness probe timeout (milliseconds).
+pub const ANNOTATION_APPLIANCE_READY_TIMEOUT_MS: &str = "io.kuasar.appliance.ready_timeout_ms";
 
 /// Selects the guest coordination protocol and device topology for a sandbox.
 ///
@@ -90,8 +126,13 @@ impl SandboxProfile {
     }
 
     /// Construct the host-side [`GuestRuntime`] for this profile.
-    pub fn create_runtime(&self, sandbox_id: &str) -> Box<dyn GuestRuntime> {
-        self.runtime_kind().create_runtime(sandbox_id)
+    ///
+    /// `default_app` is the cluster-wide fallback executable (from the
+    /// `appliance_app` TOML field in `[hypervisor]`).  It is used when the
+    /// pod annotation `io.kuasar.appliance.app` is absent.  Pass `""` on the
+    /// recovery path (reconnect is a no-op for Appliance mode).
+    pub fn create_runtime(&self, sandbox_id: &str, default_app: &str) -> Box<dyn GuestRuntime> {
+        self.runtime_kind().create_runtime(sandbox_id, default_app)
     }
 
     /// Whether the hypervisor should start a virtiofsd / virtiofs-daemon

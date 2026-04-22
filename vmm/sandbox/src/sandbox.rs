@@ -62,7 +62,7 @@ const DEFAULT_SHUTDOWN_DEADLINE_MS: u64 = 10_000;
 /// Deserialized sandboxes always have their runtime rebuilt in `recover()` before
 /// use; this placeholder is never actually called on any live code path.
 fn default_runtime() -> Box<dyn GuestRuntime> {
-    RuntimeKind::default().create_runtime("")
+    RuntimeKind::default().create_runtime("", "")
 }
 
 pub struct KuasarSandboxer<F: VMFactory, H: Hooks<F::VM>> {
@@ -218,7 +218,7 @@ where
             id_generator: 0,
             network: None,
             runtime_kind: profile.runtime_kind(),
-            runtime: profile.create_runtime(id),
+            runtime: profile.create_runtime(id, self.factory.appliance_default_app()),
             exit_signal: Arc::new(ExitSignal::default()),
             sandbox_cgroups,
         };
@@ -485,7 +485,8 @@ where
             };
             // Rebuild the guest runtime and reconnect to the already-running guest agent.
             let address = sb.vm.socket_address();
-            let mut runtime = sb.runtime_kind.create_runtime(&sb.data.id);
+            // Recovery path: default_app is not needed (reconnect is a no-op for ApplianceRuntime).
+            let mut runtime = sb.runtime_kind.create_runtime(&sb.data.id, "");
             if let Err(e) = runtime.reconnect(&address).await {
                 if let Err(re) = sb.stop(true).await {
                     warn!("roll back in recover, reconnect runtime and stop: {}", re);

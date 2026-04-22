@@ -45,6 +45,15 @@ pub trait VMFactory {
     fn supports_appliance_mode(&self) -> bool {
         false
     }
+
+    /// The cluster-wide default app executable for Appliance mode.
+    ///
+    /// Used as a fallback when the pod annotation `io.kuasar.appliance.app` is
+    /// absent.  Returns `""` by default; only `CloudHypervisorVMFactory`
+    /// overrides this with the `appliance_app` value from the TOML config.
+    fn appliance_default_app(&self) -> &str {
+        ""
+    }
 }
 
 #[async_trait]

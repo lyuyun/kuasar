@@ -57,6 +57,13 @@ impl VMFactory for CloudHypervisorVMFactory {
         true
     }
 
+    /// Cluster-wide default app executable for Appliance mode; read from the
+    /// `appliance_app` field in the `[hypervisor]` TOML section.  Used by
+    /// `ApplianceRuntime` as a fallback when the pod annotation is absent.
+    fn appliance_default_app(&self) -> &str {
+        &self.vm_config.appliance_app
+    }
+
     async fn create_vm(
         &self,
         id: &str,
@@ -72,7 +79,6 @@ impl VMFactory for CloudHypervisorVMFactory {
         // must be set to the **absolute local path** of the pre-staged erofs image.
         // Falls back to `image_path` from the hypervisor config when the annotation is
         // absent (useful when all pods boot the same appliance image).
-        // An Appliance sandbox with no image resolved from either source is an error.
         //
         // TODO: replace with automatic resolution via ContainerData.rootfs once the
         // deferred-boot flow (append_container → boot) is implemented.
@@ -128,15 +134,18 @@ impl VMFactory for CloudHypervisorVMFactory {
             }
         };
 
-        // Appliance mode: inject per-sandbox kernel parameters that kuasar-init reads
-        // from /proc/cmdline.
+        // Appliance mode: inject only KUASAR_SANDBOX_ID into the kernel cmdline.
+        // All other sandbox configuration (app, args, env, hostname, DNS, …) is
+        // delivered to kuasar-init via the vsock BOOTSTRAP message after boot,
+        // removing the 4096-byte cmdline length limit and all escaping constraints.
+        //
+        // Early validation: fail here (at sandbox create time) if no app is configured,
+        // rather than discovering the problem later at VM boot.
         if matches!(self.profile, SandboxProfile::Appliance) {
             vm.config
                 .cmdline
                 .push_str(&format!(" KUASAR_SANDBOX_ID={}", id));
 
-            // Resolve the application executable.  The annotation takes priority;
-            // the config-level `appliance_app` field serves as a cluster-wide default.
             let app = s
                 .sandbox
                 .config
@@ -154,38 +163,7 @@ impl VMFactory for CloudHypervisorVMFactory {
                 )
                 .into());
             }
-
-            vm.config.cmdline.push_str(&format!(" KUASAR_APP={}", app));
-
-            let hostname = s
-                .sandbox
-                .config
-                .as_ref()
-                .map(|c| c.hostname.as_str())
-                .unwrap_or("");
-            if !hostname.is_empty() {
-                vm.config
-                    .cmdline
-                    .push_str(&format!(" KUASAR_HOSTNAME={}", hostname));
-            }
-
-            if let Some(dns) = s
-                .sandbox
-                .config
-                .as_ref()
-                .and_then(|c| c.dns_config.as_ref())
-            {
-                if !dns.servers.is_empty() {
-                    vm.config
-                        .cmdline
-                        .push_str(&format!(" KUASAR_DNS_SERVERS={}", dns.servers.join(",")));
-                }
-                if !dns.searches.is_empty() {
-                    vm.config
-                        .cmdline
-                        .push_str(&format!(" KUASAR_DNS_SEARCHES={}", dns.searches.join(",")));
-                }
-            }
+            // app is valid — ApplianceRuntime will include it in the BOOTSTRAP message.
         }
 
         // add console device

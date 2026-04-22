@@ -59,10 +59,14 @@ impl RuntimeKind {
     /// Single source of truth for the `RuntimeKind → GuestRuntime` mapping, used
     /// by both the initial create path (via `SandboxProfile::create_runtime`) and
     /// the recovery path.
-    pub fn create_runtime(&self, sandbox_id: &str) -> Box<dyn GuestRuntime> {
+    ///
+    /// `default_app` is the cluster-wide fallback executable for Appliance mode
+    /// (from the `appliance_app` TOML field).  Pass `""` on the recovery path
+    /// where the bootstrap is not needed (reconnect is a no-op for Appliance).
+    pub fn create_runtime(&self, sandbox_id: &str, default_app: &str) -> Box<dyn GuestRuntime> {
         match self {
             Self::VmmTask => Box::new(VmmTaskRuntime::new()),
-            Self::Appliance => Box::new(ApplianceRuntime::new(sandbox_id)),
+            Self::Appliance => Box::new(ApplianceRuntime::new(sandbox_id, default_app)),
         }
     }
 }
@@ -155,5 +159,13 @@ mod tests {
         }
         let w: Wrapper = serde_json::from_str("{}").unwrap();
         assert!(matches!(w.runtime_kind, RuntimeKind::VmmTask));
+    }
+
+    #[test]
+    fn test_create_runtime_vmm_task_ignores_default_app() {
+        // VmmTask runtime doesn't use the default_app parameter.
+        let rt = RuntimeKind::VmmTask.create_runtime("sb-001", "/usr/bin/ignored");
+        // Just verify it doesn't panic and returns a valid runtime.
+        drop(rt);
     }
 }
