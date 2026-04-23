@@ -38,6 +38,36 @@ pub trait VMFactory {
     type Config: Sync + Send;
     fn new(config: Self::Config) -> Self;
     async fn create_vm(&self, id: &str, s: &SandboxOption) -> Result<Self::VM>;
+
+    /// Whether this factory supports application-level snapshot restore.
+    /// Defaults to `false`; override to `true` in hypervisors that implement
+    /// [`restore_vm`] and [`snapshot_vm`].
+    fn supports_app_snapshot(&self) -> bool {
+        false
+    }
+
+    /// Restore a VM from a previously taken snapshot located at `source_url`.
+    /// The returned VM is ready to receive post-restore initialisation
+    /// (entropy injection, network reprogramming, clock sync).
+    ///
+    /// Default implementation returns an error; override in hypervisors that
+    /// support snapshots.
+    async fn restore_vm(&self, _id: &str, _s: &SandboxOption, _source_url: &str) -> Result<Self::VM> {
+        Err(containerd_sandbox::error::Error::Other(
+            anyhow::anyhow!("restore_vm is not implemented for this hypervisor"),
+        ))
+    }
+
+    /// Pause the VM, write a snapshot to `destination_url`, then resume.
+    /// Called by [`SnapshotManager::create_snapshot`].
+    ///
+    /// Default implementation returns an error; override in hypervisors that
+    /// support snapshots.
+    async fn snapshot_vm(&self, _vm: &Self::VM, _destination_url: &str) -> Result<()> {
+        Err(containerd_sandbox::error::Error::Other(
+            anyhow::anyhow!("snapshot_vm is not implemented for this hypervisor"),
+        ))
+    }
 }
 
 #[async_trait]
@@ -71,6 +101,15 @@ pub trait VM: Serialize + Sync + Send {
     async fn wait_channel(&self) -> Option<Receiver<(u32, i128)>>;
     async fn vcpus(&self) -> Result<VcpuThreads>;
     fn pids(&self) -> Pids;
+
+    /// Pause the running VM, write a snapshot to `destination_url`, then
+    /// resume.  Only supported by hypervisors that implement application
+    /// snapshots; the default returns `Unsupported`.
+    async fn snapshot_live(&self, _destination_url: &str) -> Result<()> {
+        Err(containerd_sandbox::error::Error::Other(anyhow::anyhow!(
+            "snapshot_live is not implemented for this hypervisor"
+        )))
+    }
 }
 
 #[macro_export]

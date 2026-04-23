@@ -39,6 +39,10 @@ impl VMFactory for CloudHypervisorVMFactory {
         Self { vm_config: config }
     }
 
+    fn supports_app_snapshot(&self) -> bool {
+        true
+    }
+
     async fn create_vm(
         &self,
         id: &str,
@@ -79,5 +83,49 @@ impl VMFactory for CloudHypervisorVMFactory {
         }
 
         Ok(vm)
+    }
+
+    /// Restore a Cloud Hypervisor VM from a snapshot at `source_url`.
+    ///
+    /// The sequence is:
+    /// 1. Spawn a new `cloud-hypervisor` process (no `--kernel`/`--memory` —
+    ///    those come from the snapshot).
+    /// 2. Connect to the API socket.
+    /// 3. Call `PUT /api/v1/vm.restore` with `prefault=true` for fast startup.
+    async fn restore_vm(
+        &self,
+        id: &str,
+        s: &SandboxOption,
+        source_url: &str,
+    ) -> containerd_sandbox::error::Result<Self::VM> {
+        use log::info;
+
+        let netns = get_netns(&s.sandbox);
+        let mut vm = CloudHypervisorVM::new(id, &netns, &s.base_dir, &self.vm_config);
+
+        // Vsock is needed for agent communication after restore.
+        let guest_socket_path = format!("{}/task.vsock", s.base_dir);
+        let vsock = Vsock::new(3, &guest_socket_path, "vsock");
+        vm.add_device(vsock);
+        vm.agent_socket = format!("hvsock://{}:1024", guest_socket_path);
+
+        // Console for log capture.
+        let console_path = format!("/tmp/{}-task.log", id);
+        let console = Console::new(&console_path, "console");
+        vm.add_device(console);
+
+        vm.restore_from_snapshot(source_url).await?;
+
+        info!("sandbox {} restored from snapshot {}", id, source_url);
+        Ok(vm)
+    }
+
+    /// Pause the VM, take a snapshot to `destination_url`, then resume.
+    async fn snapshot_vm(
+        &self,
+        vm: &Self::VM,
+        destination_url: &str,
+    ) -> containerd_sandbox::error::Result<()> {
+        vm.snapshot_via_api(destination_url).await
     }
 }

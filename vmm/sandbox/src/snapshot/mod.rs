@@ -13,28 +13,16 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-#![warn(clippy::expect_fun_call, clippy::expect_used)]
 
-#[macro_use]
-mod device;
+pub mod error;
+pub mod manager;
+pub mod metrics;
+pub mod mgmt_server;
+pub mod post_restore;
+pub mod store;
+pub mod warm_pool;
 
-mod cgroup;
-mod client;
-mod container;
-mod io;
-mod network;
-mod param;
-mod storage;
-mod vm;
-
-pub mod args;
-pub mod cloud_hypervisor;
-pub mod config;
-pub mod kata_config;
-pub mod metrics_server;
-pub mod qemu;
-pub mod sandbox;
-pub mod snapshot;
-pub mod stratovirt;
-pub mod utils;
-pub mod version;
+pub use manager::{get_snapshot_key, SnapshotManager, SNAPSHOT_KEY_ANNOTATION};
+pub use mgmt_server::{start as start_mgmt_server, DEFAULT_SNAPSHOT_MGMT_SOCK};
+pub use store::{SnapshotId, SnapshotKey, SnapshotMetadata, SnapshotStore};
+pub use warm_pool::{start_replenish_loop, WarmPool};

@@ -23,6 +23,7 @@ use vmm_sandboxer::{
     cloud_hypervisor::{factory::CloudHypervisorVMFactory, hooks::CloudHypervisorHooks},
     config::Config,
     sandbox::KuasarSandboxer,
+    snapshot::{start_mgmt_server, SnapshotStore},
     version,
 };
 
@@ -43,6 +44,7 @@ async fn main() {
     trace::set_enabled(config.sandbox.enable_tracing);
     trace::setup_tracing(&log_level, service_name).unwrap();
     vmm_sandboxer::utils::start_watchdog();
+    vmm_sandboxer::metrics_server::start();
     if let Err(e) = sd_notify::notify(&[sd_notify::NotifyState::Ready]) {
         log::error!("failed to send ready notify: {}", e);
     }
@@ -53,6 +55,10 @@ async fn main() {
             config.hypervisor,
             CloudHypervisorHooks::default(),
         );
+
+    // Start the snapshot management ttrpc server before handing ownership of
+    // the sandboxer to containerd_sandbox::run.
+    start_mgmt_server(sandboxer.sandboxes(), SnapshotStore::default_store());
 
     tokio::spawn(async move {
         signal::handle_signals(&log_level, service_name).await;

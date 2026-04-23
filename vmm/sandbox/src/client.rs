@@ -48,7 +48,10 @@ use ttrpc::{
     r#async::{Client, TtrpcContext},
 };
 use vmm_common::api::{
-    sandbox::{CheckRequest, SetupSandboxRequest, SyncClockPacket},
+    sandbox::{
+        CheckRequest, InjectEntropyRequest, ReconfigureNetworkRequest,
+        SetupSandboxRequest, SyncClockPacket,
+    },
     sandbox_ttrpc::SandboxServiceClient,
 };
 
@@ -384,6 +387,59 @@ fn checked_compute_delta(c_send: i64, c_arrive: i64, s_send: i64, s_arrive: i64)
         .ok_or_else(|| anyhow!("integer overflow {} / 2", delta_sum))?;
 
     Ok(delta)
+}
+
+/// Inject 256 bytes of fresh host entropy into the guest kernel's `/dev/random`
+/// pool via the dedicated `InjectEntropy` RPC.
+pub(crate) async fn client_inject_entropy(client: &SandboxServiceClient) -> Result<()> {
+    use tokio::io::AsyncReadExt;
+
+    let mut entropy = [0u8; 256];
+    let mut f = tokio::fs::File::open("/dev/urandom")
+        .await
+        .map_err(|e| anyhow!("open /dev/urandom: {}", e))?;
+    f.read_exact(&mut entropy)
+        .await
+        .map_err(|e| anyhow!("read /dev/urandom: {}", e))?;
+
+    let mut req = InjectEntropyRequest::new();
+    req.entropy_bytes = entropy.to_vec();
+
+    client
+        .inject_entropy(
+            with_timeout(Duration::from_secs(5).as_nanos() as i64),
+            &req,
+        )
+        .await
+        .map_err(|e| anyhow!("inject_entropy RPC: {}", e))?;
+    Ok(())
+}
+
+/// Push interface and route configuration to the guest after snapshot restore
+/// via the dedicated `ReconfigureNetwork` RPC.
+pub(crate) async fn client_reconfigure_network(
+    client: &SandboxServiceClient,
+    network: &crate::network::Network,
+) -> Result<()> {
+    let interfaces: Vec<_> = network.interfaces().iter().map(Into::into).collect();
+    let routes: Vec<_> = network.routes().iter().map(Into::into).collect();
+
+    if interfaces.is_empty() && routes.is_empty() {
+        return Ok(());
+    }
+
+    let mut req = ReconfigureNetworkRequest::new();
+    req.interfaces = interfaces;
+    req.routes = routes;
+
+    client
+        .reconfigure_network(
+            with_timeout(Duration::from_secs(10).as_nanos() as i64),
+            &req,
+        )
+        .await
+        .map_err(|e| anyhow!("reconfigure_network RPC: {}", e))?;
+    Ok(())
 }
 
 pub(crate) async fn publish_event(envelope: Envelope) -> Result<()> {

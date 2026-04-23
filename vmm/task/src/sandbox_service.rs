@@ -41,8 +41,9 @@ use vmm_common::{
         empty::Empty,
         events::Envelope,
         sandbox::{
-            CheckRequest, ExecVMProcessRequest, ExecVMProcessResponse, SetupSandboxRequest,
-            SyncClockPacket, UpdateInterfacesRequest, UpdateRoutesRequest,
+            CheckRequest, ExecVMProcessRequest, ExecVMProcessResponse,
+            InjectEntropyRequest, ReconfigureNetworkRequest,
+            SetupSandboxRequest, SyncClockPacket, UpdateInterfacesRequest, UpdateRoutesRequest,
         },
     },
 };
@@ -130,6 +131,38 @@ impl api::sandbox_ttrpc::SandboxService for SandboxService {
         // Set Routes
         self.handle.lock().await.update_routes(req.routes).await?;
 
+        Ok(Empty::new())
+    }
+
+    async fn inject_entropy(
+        &self,
+        _ctx: &TtrpcContext,
+        req: InjectEntropyRequest,
+    ) -> TtrpcResult<Empty> {
+        use tokio::io::AsyncWriteExt;
+        let mut f = tokio::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/random")
+            .await
+            .map_err(|e| ttrpc::Error::Others(format!("open /dev/random: {}", e)))?;
+        f.write_all(&req.entropy_bytes)
+            .await
+            .map_err(|e| ttrpc::Error::Others(format!("write /dev/random: {}", e)))?;
+        Ok(Empty::new())
+    }
+
+    async fn reconfigure_network(
+        &self,
+        _ctx: &TtrpcContext,
+        req: ReconfigureNetworkRequest,
+    ) -> TtrpcResult<Empty> {
+        let handle = self.handle.lock().await;
+        if !req.interfaces.is_empty() {
+            handle.update_interfaces(req.interfaces).await?;
+        }
+        if !req.routes.is_empty() {
+            handle.update_routes(req.routes).await?;
+        }
         Ok(Empty::new())
     }
 

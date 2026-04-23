@@ -2167,8 +2167,14 @@ dependencies = [
  "clap",
  "env_logger 0.11.9",
  "log",
+ "protobuf 3.2.0",
+ "serde",
+ "serde_json",
+ "sha2",
  "tempfile",
  "tokio",
+ "ttrpc",
+ "vmm-common",
 ]
 
 [[package]]
@@ -3242,6 +3248,20 @@ dependencies = [
  "bitflags 2.11.0",
  "chrono",
  "hex",
+]
+
+[[package]]
+name = "prometheus"
+version = "0.13.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3d33c28a30771f7f96db69893f78b857f7450d7e0237e9c8fc6427a81bae7ed1"
+dependencies = [
+ "cfg-if 1.0.1",
+ "fnv",
+ "lazy_static",
+ "memchr",
+ "parking_lot",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -5053,6 +5073,7 @@ dependencies = [
  "containerd-shim",
  "futures-util",
  "hostname",
+ "hyper",
  "lazy_static",
  "log",
  "netlink-packet-core 0.7.0",
@@ -5063,6 +5084,7 @@ dependencies = [
  "path-clean",
  "proc-macro2",
  "procfs 0.13.3",
+ "prometheus",
  "prost-types 0.10.1",
  "protobuf 3.2.0",
  "qapi",
@@ -5074,6 +5096,7 @@ dependencies = [
  "serde",
  "serde_derive",
  "serde_json",
+ "sha2",
  "temp-dir",
  "time",
  "tokio",

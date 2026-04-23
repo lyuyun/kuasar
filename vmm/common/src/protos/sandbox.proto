@@ -33,6 +33,10 @@ service SandboxService {
     rpc SyncClock (SyncClockPacket) returns (SyncClockPacket);
     rpc GetEvents (google.protobuf.Empty) returns (containerd.services.events.ttrpc.v1.Envelope);
     rpc SetupSandbox (SetupSandboxRequest) returns (google.protobuf.Empty);
+
+    // app snapshot — post-restore initialisation
+    rpc InjectEntropy (InjectEntropyRequest) returns (google.protobuf.Empty);
+    rpc ReconfigureNetwork (ReconfigureNetworkRequest) returns (google.protobuf.Empty);
 }
 
 message CheckRequest {
@@ -115,6 +119,24 @@ message UpdateRoutesRequest {
 
 message SetupSandboxRequest {
     google.protobuf.Any config = 1;
+    repeated Interface interfaces = 2;
+    repeated Route routes = 3;
+}
+
+// InjectEntropyRequest carries fresh entropy bytes to be injected into the
+// guest kernel's /dev/random pool after a snapshot restore, preventing
+// entropy starvation from frozen PRNG state.
+message InjectEntropyRequest {
+    // entropy_bytes should be at least 256 bytes of cryptographically random
+    // data gathered from the host's getrandom(GRND_RANDOM).
+    bytes entropy_bytes = 1;
+}
+
+// ReconfigureNetworkRequest is sent after snapshot restore to replace the
+// template NIC MAC address with a sandbox-unique one and apply new IP config.
+message ReconfigureNetworkRequest {
+    // new_mac is the HMAC-SHA256-derived unique MAC for this restored instance.
+    string new_mac = 1;
     repeated Interface interfaces = 2;
     repeated Route routes = 3;
 }

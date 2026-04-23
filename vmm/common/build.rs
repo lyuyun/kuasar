@@ -21,6 +21,7 @@ use ttrpc_codegen::{Codegen, Customize, ProtobufCustomize};
 fn main() {
     let protos = [
         "src/protos/sandbox.proto",
+        "src/protos/snapshot_mgmt.proto",
         "src/protos/github.com/containerd/containerd/api/services/ttrpc/events/v1/events.proto",
         "src/protos/github.com/containerd/containerd/protobuf/plugin/fieldpath.proto",
         "src/protos/google/protobuf/any.proto",

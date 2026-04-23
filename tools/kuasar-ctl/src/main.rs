@@ -22,6 +22,7 @@ use tokio::net::UnixStream;
 use tokio::time::timeout as tokio_timeout;
 
 mod sandbox;
+mod snapshot;
 
 const EXIT_MARKER: &str = "__KSR_EXIT__";
 const INTERRUPTED_EXIT_CODE: i32 = 130;
@@ -36,6 +37,12 @@ struct Cli {
 
 #[derive(clap::Subcommand)]
 enum Commands {
+    /// Manage Kuasar application snapshots
+    Snapshot {
+        #[command(subcommand)]
+        command: snapshot::SnapshotCommands,
+    },
+
     /// Execute a command in a Cloud Hypervisor guest via debug console (hvsock)
     Exec {
         /// Sandbox ID or prefix
@@ -74,6 +81,7 @@ async fn run() -> Result<i32> {
     let cli = Cli::parse();
 
     match cli.command {
+        Commands::Snapshot { command } => snapshot::run(command).await,
         Commands::Exec {
             sandbox,
             command,

@@ -71,6 +71,10 @@ pub struct CloudHypervisorVM {
     #[serde(skip)]
     fds: Vec<OwnedFd>,
     pids: Pids,
+    /// Set to true after a successful `restore_from_snapshot()` so that
+    /// `start()` can skip re-launching the process.
+    #[serde(default)]
+    was_restored: bool,
 }
 
 impl CloudHypervisorVM {
@@ -96,6 +100,7 @@ impl CloudHypervisorVM {
             client: None,
             fds: vec![],
             pids: Pids::default(),
+            was_restored: false,
         }
     }
 
@@ -160,6 +165,11 @@ impl CloudHypervisorVM {
 impl VM for CloudHypervisorVM {
     #[instrument(skip_all)]
     async fn start(&mut self) -> Result<u32> {
+        // A restored VM is already running; skip the full boot sequence.
+        if self.was_restored {
+            return Ok(self.pids.vmm_pid.unwrap_or_default());
+        }
+
         create_dir_all(&self.base_dir).await?;
         let virtiofsd_pid = self.start_virtiofsd().await?;
         // TODO: add child virtiofsd process
@@ -340,6 +350,10 @@ impl VM for CloudHypervisorVM {
     fn pids(&self) -> Pids {
         self.pids.clone()
     }
+
+    async fn snapshot_live(&self, destination_url: &str) -> Result<()> {
+        self.snapshot_via_api(destination_url).await
+    }
 }
 
 #[async_trait]
@@ -358,6 +372,134 @@ impl crate::vm::Recoverable for CloudHypervisorVM {
     }
 }
 
+impl CloudHypervisorVM {
+    /// Pause the VM, write a snapshot to `destination_url`, then resume.
+    /// Uses the existing client if available; otherwise creates a fresh one.
+    pub async fn snapshot_via_api(&self, destination_url: &str) -> Result<()> {
+        let mut client = self.create_client().await?;
+        client.pause()?;
+        let snap_result = client.snapshot(destination_url);
+        let resume_result = client.resume();
+        snap_result?;
+        resume_result?;
+        Ok(())
+    }
+
+    /// Spawn a new `cloud-hypervisor` process in restore mode (no boot
+    /// params), connect to its API socket, then call `PUT /vm.restore`.
+    /// Also starts virtiofsd and remaps the virtiofs device to the new socket.
+    ///
+    /// On success `self.was_restored` is true and the VM is ready for
+    /// post-restore initialisation.
+    pub async fn restore_from_snapshot(&mut self, source_url: &str) -> Result<u32> {
+        create_dir_all(&self.base_dir).await?;
+
+        // CVE-2015-2877 mitigation: disable KSM to prevent cross-instance
+        // memory deduplication side-channels.  All restored VMs share the
+        // same initial memory content, making KSM merges especially potent.
+        if let Err(e) = tokio::fs::write("/sys/kernel/mm/ksm/run", b"0").await {
+            warn!("could not disable KSM ({}); cross-VM side-channel risk elevated", e);
+        }
+
+        // virtiofsd must be running before CHv tries to reconnect the virtio-fs
+        // device.  Start it at the new base_dir socket path.
+        if !self.virtiofsd_config.socket_path.is_empty() {
+            let vfsd_pid = self.start_virtiofsd().await?;
+            self.pids.affiliated_pids.push(vfsd_pid);
+        }
+
+        // For restore mode only the API socket (no --kernel/--memory/--fs).
+        let mut params: Vec<String> = vec![
+            "--api-socket".to_string(),
+            self.config.api_socket.clone(),
+        ];
+        if let Some(ref log_file) = self.config.log_file {
+            params.push("--log-file".to_string());
+            params.push(log_file.clone());
+        }
+        if self.config.debug {
+            params.push("-vv".to_string());
+        }
+        // Non-fs devices (vsock, console) that CHv needs at process start.
+        for d in self.devices.iter() {
+            params.extend(d.to_cmdline_params("--"));
+        }
+
+        let child = {
+            let mut cmd = tokio::process::Command::new(&self.config.path);
+            cmd.args(&params);
+            set_cmd_netns(&mut cmd, self.netns.clone())?;
+            cmd.stdout(Stdio::piped());
+            cmd.stderr(Stdio::piped());
+            info!(
+                "spawning cloud-hypervisor {} in restore mode: {:?}",
+                self.id, cmd
+            );
+            cmd.spawn()
+                .map_err(|e| anyhow!("failed to spawn cloud-hypervisor for restore: {}", e))?
+        };
+
+        let pid = child.id();
+        self.pids.vmm_pid = pid;
+        info!(
+            "cloud-hypervisor restore {} running with pid {}",
+            self.id,
+            pid.unwrap_or_default()
+        );
+
+        let pid_file = format!("{}/pid", self.base_dir);
+        let (tx, rx) = channel((0u32, 0i128));
+        self.wait_chan = Some(rx);
+        spawn_wait(
+            child,
+            format!("cloud-hypervisor-restore {}", self.id),
+            Some(pid_file),
+            Some(tx),
+        );
+
+        match self.create_client().await {
+            Ok(client) => self.client = Some(client),
+            Err(e) => {
+                if let Err(re) = self.stop(true).await {
+                    warn!("rollback connecting api during restore: {}", re);
+                }
+                return Err(e);
+            }
+        }
+
+        // Trigger the actual restore via the CHv REST API.
+        if let Err(e) = self.get_client()?.restore(source_url, true) {
+            if let Err(re) = self.stop(true).await {
+                warn!("rollback after failed restore: {}", re);
+            }
+            return Err(e);
+        }
+
+        // Remap the virtiofs device: remove the snapshot's stale socket path
+        // and hot-add the new one at this sandbox's base_dir.
+        if !self.virtiofsd_config.socket_path.is_empty() {
+            let new_socket = self.virtiofsd_config.socket_path.clone();
+            let client = self.get_client()?;
+            // Best-effort: ignore errors if the device wasn't in the snapshot.
+            let _ = client.hot_detach("fs");
+            client
+                .add_fs("fs", &new_socket, "kuasar")
+                .map_err(|e| anyhow!("remap virtiofs after restore: {}", e))?;
+            info!(
+                "virtiofs remapped to new socket {} for {}",
+                new_socket, self.id
+            );
+        }
+
+        self.was_restored = true;
+        Ok(pid.unwrap_or_default())
+    }
+
+    pub fn was_restored(&self) -> bool {
+        self.was_restored
+    }
+}
+
 macro_rules! read_stdio {
     ($stdio:expr, $cmd_name:ident) => {
         if let Some(std) = $stdio {
@@ -369,7 +511,7 @@ macro_rules! read_stdio {
     };
 }
 
-fn spawn_wait(
+pub(crate) fn spawn_wait(
     child: Child,
     cmd_name: String,
     pid_file_path: Option<String>,

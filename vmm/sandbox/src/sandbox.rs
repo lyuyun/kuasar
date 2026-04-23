@@ -57,34 +57,60 @@ use crate::{
 
 pub const KUASAR_GUEST_SHARE_DIR: &str = "/run/kuasar/storage/containers/";
 
-pub struct KuasarSandboxer<F: VMFactory, H: Hooks<F::VM>> {
-    factory: F,
+pub struct KuasarSandboxer<F: VMFactory, H: Hooks<F::VM>>
+where
+    F: VMFactory + Sync + Send + 'static,
+    F::VM: VM + Sync + Send + 'static,
+{
+    factory: Arc<F>,
     hooks: H,
     #[allow(dead_code)]
     config: SandboxConfig,
     #[allow(clippy::type_complexity)]
     sandboxes: Arc<RwLock<HashMap<String, Arc<Mutex<KuasarSandbox<F::VM>>>>>>,
+    warm_pool: Option<Arc<crate::snapshot::WarmPool<F>>>,
 }
 
 impl<F, H> KuasarSandboxer<F, H>
 where
-    F: VMFactory,
+    F: VMFactory + Sync + Send + 'static,
     H: Hooks<F::VM>,
-    F::VM: VM + Sync + Send,
+    F::VM: VM + Sync + Send + 'static,
 {
+    /// Returns a clone of the shared sandboxes map for use by external services
+    /// (e.g. the snapshot management ttrpc server).
+    pub fn sandboxes(
+        &self,
+    ) -> Arc<RwLock<HashMap<String, Arc<Mutex<KuasarSandbox<F::VM>>>>>> {
+        self.sandboxes.clone()
+    }
+
     pub fn new(config: SandboxConfig, vmm_config: F::Config, hooks: H) -> Self {
+        let factory = Arc::new(F::new(vmm_config));
+        let warm_pool = if config.warm_pool_size > 0 && factory.supports_app_snapshot() {
+            let store = crate::snapshot::SnapshotStore::default_store();
+            Some(Arc::new(crate::snapshot::WarmPool::new(
+                Arc::clone(&factory),
+                store,
+                config.warm_pool_size,
+                config.warm_pool_work_dir.clone(),
+            )))
+        } else {
+            None
+        };
         Self {
-            factory: F::new(vmm_config),
+            factory,
             hooks,
             config,
             sandboxes: Arc::new(Default::default()),
+            warm_pool,
         }
     }
 }
 
 impl<F, H> KuasarSandboxer<F, H>
 where
-    F: VMFactory,
+    F: VMFactory + Sync + Send + 'static,
     H: Hooks<F::VM>,
     F::VM: VM + DeserializeOwned + Recoverable + Sync + Send + 'static,
 {
@@ -174,6 +200,17 @@ where
             fail,
             start.elapsed().as_secs_f64()
         );
+
+        // Prime the warm pool after recovery so slots are ready for incoming
+        // creates.  We scan the snapshot store for all registered keys.
+        if let Some(ref pool) = self.warm_pool {
+            let store = crate::snapshot::SnapshotStore::default_store();
+            if let Ok(snapshots) = store.list().await {
+                for meta in snapshots {
+                    pool.prime(&meta.key).await;
+                }
+            }
+        }
     }
 }
 
@@ -194,12 +231,16 @@ pub struct KuasarSandbox<V: VM> {
     pub(crate) exit_signal: Arc<ExitSignal>,
     #[serde(default)]
     pub(crate) sandbox_cgroups: SandboxCgroup,
+    /// Set to true when this sandbox was created via snapshot restore.
+    /// Causes `start()` to run post-restore init instead of `setup_sandbox`.
+    #[serde(default)]
+    pub(crate) restored_from_snapshot: bool,
 }
 
 #[async_trait]
 impl<F, H> Sandboxer for KuasarSandboxer<F, H>
 where
-    F: VMFactory + Sync + Send,
+    F: VMFactory + Sync + Send + 'static,
     F::VM: VM + Sync + Send + 'static,
     H: Hooks<F::VM> + Sync + Send,
 {
@@ -229,12 +270,98 @@ where
                 return Err(e);
             }
         }
-        let vm = self.factory.create_vm(id, &s).await?;
+
+        // If a snapshot key is present, try to restore from snapshot.
+        // Priority: warm-pool hit → cold restore → fresh VM (fallback).
+        let mut restored_from_snapshot = false;
+        let (vm, effective_base_dir) = if let Some(ref snapshot_key) =
+            crate::snapshot::get_snapshot_key(&s)
+        {
+            if self.factory.supports_app_snapshot() {
+                info!(
+                    "sandbox {}: restoring from app snapshot key '{}'",
+                    id, snapshot_key
+                );
+
+                // 1. Try warm pool (instant).
+                if let Some(ref pool) = self.warm_pool {
+                    if let Some(slot) = pool.acquire(snapshot_key, id).await {
+                        info!(
+                            "sandbox {}: warm-pool hit (slot {})",
+                            id, slot.temp_id
+                        );
+                        restored_from_snapshot = true;
+                        let base = slot.base_dir.clone();
+                        (slot.vm, base)
+                    } else {
+                        // 2. Cold restore.
+                        let store = crate::snapshot::SnapshotStore::default_store();
+                        match store.get_by_key(snapshot_key).await {
+                            Ok(meta) => {
+                                let source_url = store.source_url(&meta.id);
+                                match self.factory.restore_vm(id, &s, &source_url).await {
+                                    Ok(vm) => {
+                                        restored_from_snapshot = true;
+                                        (vm, s.base_dir.clone())
+                                    }
+                                    Err(e) => {
+                                        return Err(anyhow!(
+                                            "restore sandbox {} from snapshot '{}': {}",
+                                            id, snapshot_key, e
+                                        )
+                                        .into());
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                warn!(
+                                    "snapshot key '{}' not found ({}); fresh VM",
+                                    snapshot_key, e
+                                );
+                                (self.factory.create_vm(id, &s).await?, s.base_dir.clone())
+                            }
+                        }
+                    }
+                } else {
+                    // No warm pool: cold restore.
+                    let store = crate::snapshot::SnapshotStore::default_store();
+                    match store.get_by_key(snapshot_key).await {
+                        Ok(meta) => {
+                            let source_url = store.source_url(&meta.id);
+                            match self.factory.restore_vm(id, &s, &source_url).await {
+                                Ok(vm) => {
+                                    restored_from_snapshot = true;
+                                    (vm, s.base_dir.clone())
+                                }
+                                Err(e) => {
+                                    return Err(anyhow!(
+                                        "restore sandbox {} from snapshot '{}': {}",
+                                        id, snapshot_key, e
+                                    )
+                                    .into());
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            warn!(
+                                "snapshot key '{}' not found ({}); fresh VM",
+                                snapshot_key, e
+                            );
+                            (self.factory.create_vm(id, &s).await?, s.base_dir.clone())
+                        }
+                    }
+                }
+            } else {
+                (self.factory.create_vm(id, &s).await?, s.base_dir.clone())
+            }
+        } else {
+            (self.factory.create_vm(id, &s).await?, s.base_dir.clone())
+        };
         let mut sandbox = KuasarSandbox {
             vm,
             id: id.to_string(),
             status: SandboxStatus::Created,
-            base_dir: s.base_dir,
+            base_dir: effective_base_dir,
             data: s.sandbox.clone(),
             containers: Default::default(),
             storages: vec![],
@@ -243,6 +370,7 @@ where
             client: Arc::new(Mutex::new(None)),
             exit_signal: Arc::new(ExitSignal::default()),
             sandbox_cgroups,
+            restored_from_snapshot,
         };
 
         // setup sandbox files: hosts, hostname and resolv.conf for guest
@@ -550,7 +678,15 @@ where
             return Err(e);
         }
 
-        if let Err(e) = self.setup_sandbox().await {
+        if self.restored_from_snapshot {
+            // Post-restore init replaces setup_sandbox for restored VMs.
+            if let Err(e) = self.post_restore_init().await {
+                warn!(
+                    "sandbox {}: post-restore init failed (non-fatal): {}",
+                    self.id, e
+                );
+            }
+        } else if let Err(e) = self.setup_sandbox().await {
             if let Err(re) = self.vm.stop(true).await {
                 error!("roll back in setup sandbox client: {}", re);
                 return Err(e);
@@ -702,6 +838,41 @@ where
         if let Some(client) = &*self.client.lock().await {
             client_sync_clock(client, self.id.as_str(), self.exit_signal.clone());
         }
+    }
+
+    /// Run the three mandatory post-restore steps:
+    /// 1. Entropy injection (fixes frozen PRNG state)
+    /// 2. Clock synchronisation (fixes restore time gap)
+    /// 3. Network reconfiguration (pushes current IP config)
+    #[instrument(skip_all)]
+    pub(crate) async fn post_restore_init(&self) -> Result<()> {
+        use crate::{
+            client::client_reconfigure_network,
+            snapshot::post_restore::PostRestoreInitializer,
+        };
+
+        // Steps 1 & 2: entropy + clock via PostRestoreInitializer.
+        let initializer = PostRestoreInitializer {
+            client: self.client.clone(),
+            exit_signal: self.exit_signal.clone(),
+            sandbox_id: self.id.clone(),
+        };
+        initializer.run().await?;
+
+        // Step 3: network reconfiguration — handled here because Network: !Clone.
+        if let Some(ref network) = self.network {
+            let client_guard = self.client.lock().await;
+            if let Some(ref client) = *client_guard {
+                if let Err(e) = client_reconfigure_network(client, network).await {
+                    warn!(
+                        "sandbox {}: network reconfiguration failed: {}",
+                        self.id, e
+                    );
+                }
+            }
+        }
+
+        Ok(())
     }
 
     #[instrument(skip_all)]
@@ -907,6 +1078,17 @@ pub struct SandboxConfig {
     pub log_level: String,
     #[serde(default)]
     pub enable_tracing: bool,
+    /// Number of pre-restored VMs to keep ready per snapshot key.
+    /// 0 (default) disables the warm pool.
+    #[serde(default)]
+    pub warm_pool_size: usize,
+    /// Working directory for warm-pool VM state.
+    #[serde(default = "default_warm_pool_work_dir")]
+    pub warm_pool_work_dir: String,
+}
+
+fn default_warm_pool_work_dir() -> String {
+    crate::snapshot::warm_pool::WARM_POOL_DEFAULT_WORK_DIR.to_string()
 }
 
 impl SandboxConfig {
@@ -1110,6 +1292,7 @@ mod tests {
                 client: Arc::new(Mutex::new(None)),
                 exit_signal: Arc::new(ExitSignal::default()),
                 sandbox_cgroups: SandboxCgroup::default(),
+                restored_from_snapshot: false,
             }
         }
 

@@ -22,6 +22,8 @@ pub mod events;
 pub mod fieldpath;
 pub mod sandbox;
 pub mod sandbox_ttrpc;
+pub mod snapshot_mgmt;
+pub mod snapshot_mgmt_ttrpc;
 pub mod streaming;
 pub mod streaming_ttrpc;
 pub mod timestamp;
