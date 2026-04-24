@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{os::fd::OwnedFd, process::Stdio, time::Duration};
+use std::{os::fd::OwnedFd, path::Path, process::Stdio, time::Duration};
 
 use anyhow::anyhow;
 use async_trait::async_trait;
@@ -385,9 +385,9 @@ impl CloudHypervisorVM {
         Ok(())
     }
 
-    /// Spawn a new `cloud-hypervisor` process in restore mode (no boot
-    /// params), connect to its API socket, then call `PUT /vm.restore`.
-    /// Also starts virtiofsd and remaps the virtiofs device to the new socket.
+    /// Spawn a new `cloud-hypervisor` process in restore mode, connect to its
+    /// API socket, then call `PUT /vm.restore` with a patched `config.json`
+    /// that points virtiofsd at this sandbox's socket path.
     ///
     /// On success `self.was_restored` is true and the VM is ready for
     /// post-restore initialisation.
@@ -467,28 +467,54 @@ impl CloudHypervisorVM {
             }
         }
 
+        // Patch the snapshot's config.json to point virtiofsd at this sandbox's
+        // socket before calling restore.  CHv reads config.json during the
+        // PUT /vm.restore call and tries to open the virtiofsd socket recorded
+        // there.  Without patching it would find the old sandbox's socket path
+        // (which no longer exists), fail to connect, and exit — producing the
+        // "cloud-hypervisor-restore <id> exit" error in the logs.
+        //
+        // We create a staging directory with a patched config.json and symlinks
+        // to the large snapshot files (memory-ranges, state.json) so that CHv
+        // sees the correct socket path without needing to copy gigabytes of data.
+        let staging_dir = Path::new(&self.base_dir).join("restore-staging");
+        let restore_url = if !self.virtiofsd_config.socket_path.is_empty() {
+            match prepare_restore_staging(
+                source_url,
+                &self.virtiofsd_config.socket_path,
+                &staging_dir,
+            )
+            .await
+            {
+                Ok(url) => url,
+                Err(e) => {
+                    if let Err(re) = self.stop(true).await {
+                        warn!("rollback after staging failure: {}", re);
+                    }
+                    return Err(Error::Other(e));
+                }
+            }
+        } else {
+            source_url.to_string()
+        };
+
         // Trigger the actual restore via the CHv REST API.
-        if let Err(e) = self.get_client()?.restore(source_url, true) {
+        // After this call CHv auto-resumes the VM, so vmm-task starts executing
+        // immediately inside the guest.
+        let restore_result = self.get_client()?.restore(&restore_url, true);
+
+        // Always clean up the staging dir regardless of restore outcome.
+        if staging_dir.exists() {
+            if let Err(e) = tokio::fs::remove_dir_all(&staging_dir).await {
+                warn!("failed to remove restore staging dir: {}", e);
+            }
+        }
+
+        if let Err(e) = restore_result {
             if let Err(re) = self.stop(true).await {
                 warn!("rollback after failed restore: {}", re);
             }
             return Err(e);
-        }
-
-        // Remap the virtiofs device: remove the snapshot's stale socket path
-        // and hot-add the new one at this sandbox's base_dir.
-        if !self.virtiofsd_config.socket_path.is_empty() {
-            let new_socket = self.virtiofsd_config.socket_path.clone();
-            let client = self.get_client()?;
-            // Best-effort: ignore errors if the device wasn't in the snapshot.
-            let _ = client.hot_detach("fs");
-            client
-                .add_fs("fs", &new_socket, "kuasar")
-                .map_err(|e| anyhow!("remap virtiofs after restore: {}", e))?;
-            info!(
-                "virtiofs remapped to new socket {} for {}",
-                new_socket, self.id
-            );
         }
 
         self.was_restored = true;
@@ -498,6 +524,52 @@ impl CloudHypervisorVM {
     pub fn was_restored(&self) -> bool {
         self.was_restored
     }
+}
+
+/// Create a staging directory containing a patched `config.json` (with the
+/// virtiofsd `socket` field updated to `new_socket`) and symlinks to the
+/// large snapshot files so that CHv can restore without copying gigabytes.
+async fn prepare_restore_staging(
+    source_url: &str,
+    new_socket: &str,
+    staging_dir: &Path,
+) -> anyhow::Result<String> {
+    use crate::snapshot::store::{CONFIG_FILE, MEMORY_FILE, STATE_FILE};
+
+    let source_dir = Path::new(source_url.trim_start_matches("file://"));
+    tokio::fs::create_dir_all(staging_dir).await?;
+
+    for name in &[MEMORY_FILE, STATE_FILE] {
+        let src = source_dir.join(name);
+        let dst = staging_dir.join(name);
+        if dst.exists() {
+            tokio::fs::remove_file(&dst).await?;
+        }
+        tokio::fs::symlink(&src, &dst).await?;
+    }
+
+    let config_bytes = tokio::fs::read(source_dir.join(CONFIG_FILE))
+        .await
+        .map_err(|e| anyhow!("read config.json from snapshot: {}", e))?;
+    let patched = patch_virtiofs_socket_in_config(&config_bytes, new_socket)?;
+    tokio::fs::write(staging_dir.join(CONFIG_FILE), patched).await?;
+
+    Ok(format!("file://{}", staging_dir.display()))
+}
+
+/// Parse a CHv `config.json` and replace every `"socket"` value inside the
+/// `"fs"` array with `new_socket`.
+fn patch_virtiofs_socket_in_config(config_bytes: &[u8], new_socket: &str) -> anyhow::Result<Vec<u8>> {
+    let mut cfg: serde_json::Value = serde_json::from_slice(config_bytes)
+        .map_err(|e| anyhow!("parse config.json: {}", e))?;
+    if let Some(fs_array) = cfg.get_mut("fs").and_then(|v| v.as_array_mut()) {
+        for dev in fs_array.iter_mut() {
+            if let Some(sock) = dev.get_mut("socket") {
+                *sock = serde_json::Value::String(new_socket.to_string());
+            }
+        }
+    }
+    serde_json::to_vec(&cfg).map_err(|e| anyhow!("serialise patched config.json: {}", e))
 }
 
 macro_rules! read_stdio {

@@ -204,23 +204,6 @@ impl ChClient {
         Ok(())
     }
 
-    /// Hot-plug a virtio-fs shared-filesystem device.  Used after snapshot
-    /// restore to reconnect virtiofsd at the new socket path.
-    pub fn add_fs(&mut self, id: &str, socket: &str, tag: &str) -> Result<()> {
-        #[derive(Serialize)]
-        struct FsConfig<'a> {
-            id: &'a str,
-            socket: &'a str,
-            tag: &'a str,
-        }
-        let cfg = FsConfig { id, socket, tag };
-        let body = serde_json::to_string(&cfg)
-            .map_err(|e| anyhow!("failed to serialise fs config: {}", e))?;
-        simple_api_command(&mut self.socket, "PUT", "vm.add-fs", Some(&body))
-            .map_err(|e| anyhow!("failed to add-fs id={}: {}", id, e))?;
-        Ok(())
-    }
-
     /// Hot-plug a network device.  `fds` are the tap file descriptors that
     /// must be passed via SCM_RIGHTS alongside the request.  Returns the PCI
     /// BDF assigned to the new device if the server provides one.

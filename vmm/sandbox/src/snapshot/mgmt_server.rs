@@ -160,6 +160,33 @@ where
             sandbox_id, key, staging_url
         );
 
+        // Timing race fix: snapshot_live pauses vmm-task while it may have
+        // in-progress ttrpc response writes on the host<->guest vsock connection.
+        // When the snapshot is later restored, vmm-task resumes those writes on
+        // a now-orphaned vsock fd (the new CHv instance has no matching
+        // connection), producing "Broken pipe" errors.
+        //
+        // Mitigation: drop the host-side SandboxServiceClient *before* the
+        // pause so that vmm-task's writer tasks see EOF and flush/close cleanly.
+        // The VM is still paused by snapshot_live's internal pause call; the
+        // brief window between our drop and that pause is safe because the ttrpc
+        // server only closes connections, it does not crash.
+        //
+        // Note: sync_clock holds a clone of the client.  Dropping the sandbox's
+        // reference may not immediately close the underlying socket if the clone
+        // is still alive, but the sync_clock task sleeps for 60 s between
+        // syncs, so in practice the socket is idle and the snapshot will capture
+        // vmm-task without an active write in progress.
+        {
+            let sb = sb_mutex.lock().await;
+            let mut guard = sb.client.lock().await;
+            *guard = None;
+            // Release guard so the drop of SandboxServiceClient propagates.
+        }
+        // Give the ttrpc connection teardown a moment to reach vmm-task before
+        // the snapshot freeze.
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
         {
             let sb = sb_mutex.lock().await;
             sb.vm
