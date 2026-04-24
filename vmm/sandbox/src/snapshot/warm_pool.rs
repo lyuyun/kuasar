@@ -341,7 +341,7 @@ mod tests {
 
     use crate::{
         device::{BusType, DeviceInfo},
-        snapshot::store::{SnapshotKey, SnapshotStore, MEMORY_FILE, STATE_FILE},
+        snapshot::store::{CONFIG_FILE, SnapshotKey, SnapshotStore, MEMORY_FILE, STATE_FILE},
         vm::{Pids, VcpuThreads, VMFactory, VM},
     };
 
@@ -429,6 +429,7 @@ mod tests {
         tokio::fs::create_dir_all(&staging).await.unwrap();
         tokio::fs::write(staging.join(MEMORY_FILE), b"fake-memory").await.unwrap();
         tokio::fs::write(staging.join(STATE_FILE), b"fake-state").await.unwrap();
+        tokio::fs::write(staging.join(CONFIG_FILE), b"fake-config").await.unwrap();
 
         store
             .import_from(&staging, &SnapshotKey(key.into()), "mock")

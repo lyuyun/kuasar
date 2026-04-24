@@ -27,8 +27,9 @@ use super::error::SnapshotError;
 
 pub const DEFAULT_SNAPSHOT_ROOT: &str = "/var/lib/kuasar/snapshots";
 
-pub const MEMORY_FILE: &str = "memory.bin";
-pub const STATE_FILE: &str = "snapshot.json";
+pub const MEMORY_FILE: &str = "memory-ranges";
+pub const STATE_FILE: &str = "state.json";
+pub const CONFIG_FILE: &str = "config.json";
 pub const METADATA_FILE: &str = "metadata.json";
 pub const CHECKSUM_FILE: &str = "checksums.json";
 
@@ -87,6 +88,7 @@ pub struct SnapshotMetadata {
 struct SnapshotChecksums {
     memory_sha256: String,
     state_sha256: String,
+    config_sha256: String,
 }
 
 /// Content-addressable local store for application snapshots.
@@ -95,10 +97,11 @@ struct SnapshotChecksums {
 /// ```text
 /// <root>/
 ///   <snapshot-id>/
-///     memory.bin          – VM memory image
-///     snapshot.json       – CHv device state
+///     memory-ranges       – VM memory image (CHv filename)
+///     state.json          – CHv device state (CHv filename)
+///     config.json         – CHv VM config  (CHv filename)
 ///     metadata.json       – SnapshotMetadata
-///     checksums.json      – SHA-256 of memory.bin and snapshot.json
+///     checksums.json      – SHA-256 of memory-ranges, state.json, config.json
 ///   keys/
 ///     <snapshot-key>      – file whose content is the snapshot-id
 /// ```
@@ -210,6 +213,14 @@ impl SnapshotStore {
             });
         }
 
+        let config_actual = sha256_file(self.snapshot_dir(id).join(CONFIG_FILE)).await?;
+        if config_actual != expected.config_sha256 {
+            return Err(SnapshotError::IntegrityFailed {
+                expected: expected.config_sha256,
+                actual: config_actual,
+            });
+        }
+
         Ok(())
     }
 
@@ -226,10 +237,12 @@ impl SnapshotStore {
 
         let memory_sha256 = sha256_file(self.memory_path(id)).await?;
         let state_sha256 = sha256_file(self.state_path(id)).await?;
+        let config_sha256 = sha256_file(snap_dir.join(CONFIG_FILE)).await?;
 
         let checksums = SnapshotChecksums {
             memory_sha256,
             state_sha256,
+            config_sha256,
         };
         let checksum_bytes = serde_json::to_vec_pretty(&checksums)?;
         fs::write(snap_dir.join(CHECKSUM_FILE), checksum_bytes).await?;
@@ -260,7 +273,8 @@ impl SnapshotStore {
     pub async fn compute_id(&self, staging_dir: &Path) -> Result<SnapshotId, SnapshotError> {
         let memory_hash = sha256_file(staging_dir.join(MEMORY_FILE)).await?;
         let state_hash = sha256_file(staging_dir.join(STATE_FILE)).await?;
-        let combined = format!("{}{}", memory_hash, state_hash);
+        let config_hash = sha256_file(staging_dir.join(CONFIG_FILE)).await?;
+        let combined = format!("{}{}{}", memory_hash, state_hash, config_hash);
         let mut hasher = Sha256::new();
         hasher.update(combined.as_bytes());
         let id = format!("{:x}", hasher.finalize());
@@ -346,10 +360,10 @@ mod tests {
         (dir, store)
     }
 
-    /// Write synthetic memory.bin and snapshot.json into `dir`.
     async fn write_fake_snapshot(dir: &PathBuf) {
         fs::write(dir.join(MEMORY_FILE), b"fake-memory-content").await.unwrap();
         fs::write(dir.join(STATE_FILE), b"fake-state-content").await.unwrap();
+        fs::write(dir.join(CONFIG_FILE), b"fake-config-content").await.unwrap();
     }
 
     #[tokio::test]
@@ -412,7 +426,7 @@ mod tests {
             .await
             .unwrap();
 
-        // Tamper with memory.bin after import.
+        // Tamper with memory-ranges after import.
         let memory_path = store.memory_path(&meta.id);
         fs::write(&memory_path, b"tampered!").await.unwrap();
 
@@ -447,6 +461,7 @@ mod tests {
             fs::create_dir_all(&staging).await.unwrap();
             fs::write(staging.join(MEMORY_FILE), content).await.unwrap();
             fs::write(staging.join(STATE_FILE), b"state").await.unwrap();
+            fs::write(staging.join(CONFIG_FILE), b"config").await.unwrap();
             store
                 .import_from(&staging, &SnapshotKey(format!("key-{}", i)), "chv")
                 .await
