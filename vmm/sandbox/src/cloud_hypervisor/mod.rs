@@ -467,35 +467,34 @@ impl CloudHypervisorVM {
             }
         }
 
-        // Patch the snapshot's config.json to point virtiofsd at this sandbox's
-        // socket before calling restore.  CHv reads config.json during the
-        // PUT /vm.restore call and tries to open the virtiofsd socket recorded
-        // there.  Without patching it would find the old sandbox's socket path
-        // (which no longer exists), fail to connect, and exit — producing the
-        // "cloud-hypervisor-restore <id> exit" error in the logs.
+        // Patch the snapshot's config.json to redirect paths that are
+        // sandbox-specific: the virtiofsd socket, the vsock socket, and the
+        // console log file.  CHv reads config.json during PUT /vm.restore and
+        // tries to open every device path recorded there.  Without patching it
+        // would find the old sandbox's paths (which no longer exist) and fail.
         //
         // We create a staging directory with a patched config.json and symlinks
         // to the large snapshot files (memory-ranges, state.json) so that CHv
-        // sees the correct socket path without needing to copy gigabytes of data.
+        // sees the correct paths without needing to copy gigabytes of data.
         let staging_dir = Path::new(&self.base_dir).join("restore-staging");
-        let restore_url = if !self.virtiofsd_config.socket_path.is_empty() {
-            match prepare_restore_staging(
-                source_url,
-                &self.virtiofsd_config.socket_path,
-                &staging_dir,
-            )
-            .await
-            {
-                Ok(url) => url,
-                Err(e) => {
-                    if let Err(re) = self.stop(true).await {
-                        warn!("rollback after staging failure: {}", re);
-                    }
-                    return Err(Error::Other(e));
+        let vsock_socket_path = format!("{}/task.vsock", self.base_dir);
+        let console_file_path = format!("/tmp/{}-task.log", self.id);
+        let restore_url = match prepare_restore_staging(
+            source_url,
+            &self.virtiofsd_config.socket_path,
+            &vsock_socket_path,
+            &console_file_path,
+            &staging_dir,
+        )
+        .await
+        {
+            Ok(url) => url,
+            Err(e) => {
+                if let Err(re) = self.stop(true).await {
+                    warn!("rollback after staging failure: {}", re);
                 }
+                return Err(Error::Other(e));
             }
-        } else {
-            source_url.to_string()
         };
 
         // Trigger the actual restore via the CHv REST API.
@@ -526,12 +525,18 @@ impl CloudHypervisorVM {
     }
 }
 
-/// Create a staging directory containing a patched `config.json` (with the
-/// virtiofsd `socket` field updated to `new_socket`) and symlinks to the
-/// large snapshot files so that CHv can restore without copying gigabytes.
+/// Create a staging directory containing a patched `config.json` and symlinks
+/// to the large snapshot files so that CHv can restore without copying gigabytes.
+///
+/// Paths updated in config.json:
+/// - `fs[*].socket` → `new_virtiofs_socket` (if non-empty)
+/// - `vsock.socket` → `new_vsock_socket` (if non-empty)
+/// - `console.file` → `new_console_file` (if non-empty)
 async fn prepare_restore_staging(
     source_url: &str,
-    new_socket: &str,
+    new_virtiofs_socket: &str,
+    new_vsock_socket: &str,
+    new_console_file: &str,
     staging_dir: &Path,
 ) -> anyhow::Result<String> {
     use crate::snapshot::store::{CONFIG_FILE, MEMORY_FILE, STATE_FILE};
@@ -551,24 +556,53 @@ async fn prepare_restore_staging(
     let config_bytes = tokio::fs::read(source_dir.join(CONFIG_FILE))
         .await
         .map_err(|e| anyhow!("read config.json from snapshot: {}", e))?;
-    let patched = patch_virtiofs_socket_in_config(&config_bytes, new_socket)?;
+    let patched = patch_paths_in_config(
+        &config_bytes,
+        new_virtiofs_socket,
+        new_vsock_socket,
+        new_console_file,
+    )?;
     tokio::fs::write(staging_dir.join(CONFIG_FILE), patched).await?;
 
     Ok(format!("file://{}", staging_dir.display()))
 }
 
-/// Parse a CHv `config.json` and replace every `"socket"` value inside the
-/// `"fs"` array with `new_socket`.
-fn patch_virtiofs_socket_in_config(config_bytes: &[u8], new_socket: &str) -> anyhow::Result<Vec<u8>> {
+/// Parse a CHv `config.json` and replace sandbox-specific device paths.
+///
+/// - `fs[*].socket` → `new_virtiofs_socket` (virtiofsd socket, if non-empty)
+/// - `vsock.socket` → `new_vsock_socket` (vsock socket, if non-empty)
+/// - `console.file` → `new_console_file` (console log file, if non-empty)
+fn patch_paths_in_config(
+    config_bytes: &[u8],
+    new_virtiofs_socket: &str,
+    new_vsock_socket: &str,
+    new_console_file: &str,
+) -> anyhow::Result<Vec<u8>> {
     let mut cfg: serde_json::Value = serde_json::from_slice(config_bytes)
         .map_err(|e| anyhow!("parse config.json: {}", e))?;
-    if let Some(fs_array) = cfg.get_mut("fs").and_then(|v| v.as_array_mut()) {
-        for dev in fs_array.iter_mut() {
-            if let Some(sock) = dev.get_mut("socket") {
-                *sock = serde_json::Value::String(new_socket.to_string());
+
+    if !new_virtiofs_socket.is_empty() {
+        if let Some(fs_array) = cfg.get_mut("fs").and_then(|v| v.as_array_mut()) {
+            for dev in fs_array.iter_mut() {
+                if let Some(sock) = dev.get_mut("socket") {
+                    *sock = serde_json::Value::String(new_virtiofs_socket.to_string());
+                }
             }
         }
     }
+
+    if !new_vsock_socket.is_empty() {
+        if let Some(sock) = cfg.get_mut("vsock").and_then(|v| v.get_mut("socket")) {
+            *sock = serde_json::Value::String(new_vsock_socket.to_string());
+        }
+    }
+
+    if !new_console_file.is_empty() {
+        if let Some(file) = cfg.get_mut("console").and_then(|v| v.get_mut("file")) {
+            *file = serde_json::Value::String(new_console_file.to_string());
+        }
+    }
+
     serde_json::to_vec(&cfg).map_err(|e| anyhow!("serialise patched config.json: {}", e))
 }
 
