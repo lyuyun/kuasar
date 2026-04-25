@@ -286,22 +286,76 @@ pub async fn attach_storage(
 
 `supports_blk_sharefs()` 由 `CloudHypervisorVM` 实现，返回 `true`；QEMU VM 返回 `false` 直到 QEMU 路径实现。
 
-### 4.2 绑定挂载：bind mount → ext4 virtio-blk
+### 4.2 绑定挂载：分类处理策略
 
-容器的 bind mount（HostPath、ConfigMap 目录挂载等）同样需要切换。
+bind mount 按内容特征分三类处理，避免为小文件创建块设备（ext4 最小镜像 4MB，为单文件创建代价过高）：
 
-**目录型 bind mount**：
-```rust
-async fn handle_bind_mount_blk(...) {
-    // 创建 ext4 镜像，rsync 目录内容（同 overlay blk）
-    // 附加：bind mount 目标通常只读，ext4 也设为 ro
+| 类型 | 判断条件 | 处理方式 |
+|------|---------|---------|
+| 单文件 | 源路径是普通文件 | `SandboxFile` TTRPC 注入 |
+| 小目录 | 文件数 < 50 且总大小 < 10MB | tmpfs 挂载 + 文件逐一注入 |
+| 大目录（HostPath 等） | 其余 | ext4 virtio-blk（同 overlay blk） |
+
+**单文件注入**（ConfigMap/Secret 单文件、`/etc/hosts` 等）：
+
+扩展 `SandboxFile` 协议（与 resolv.conf 同一机制），由 `ContainerService::create_container()` 在发送 Storage 前先注入：
+
+```protobuf
+message SandboxFile {
+    string dest_path = 1;   // guest 内目标挂载路径
+    bytes  content   = 2;   // 文件内容（TTRPC 传输，< 1MB 适用）
+    uint32 mode      = 3;   // 文件权限
 }
 ```
 
-**文件型 bind mount**（ConfigMap/Secret 单文件）：
-- 将单个文件放入 ext4 镜像的根目录（`/file`）
-- Guest 挂载块设备后，从 `/run/kuasar/storage/containers/{id}/file` 访问
-- 文件较小（< 1MB），ext4 最小镜像 4MB，有一定浪费；初期可接受
+**小目录注入**（ConfigMap 目录挂载）：
+
+Guest agent 收到注入请求后在 guest 内创建 tmpfs，将文件写入，再 bind mount 到容器目标路径：
+
+```rust
+// guest task agent
+async fn inject_small_dir(req: &SmallDirInjectRequest) -> Result<()> {
+    nix::mount::mount(None, &req.tmpfs_path, Some("tmpfs"),
+        MsFlags::empty(), None)?;
+    for f in &req.files {
+        tokio::fs::write(Path::new(&req.tmpfs_path).join(&f.name), &f.content).await?;
+    }
+    Ok(())
+}
+```
+
+**大目录 bind mount**（HostPath Volume 等）：
+
+```rust
+async fn handle_bind_mount_blk(
+    &mut self, source: &str, target: &str, container_id: &str, read_only: bool,
+) -> Result<()> {
+    // 创建 ext4 镜像，rsync 目录内容，hot-attach virtio-blk
+    // 逻辑同 handle_overlay_mount_blk，bind mount 通常设为 ro
+}
+```
+
+**分类判断入口**：
+
+```rust
+pub async fn attach_bind_mount(
+    &mut self, source: &str, target: &str, container_id: &str, read_only: bool,
+) -> Result<BindMountResult> {
+    let meta = tokio::fs::metadata(source).await?;
+    if meta.is_file() {
+        let content = tokio::fs::read(source).await?;
+        return Ok(BindMountResult::Inject(SandboxFile {
+            dest_path: target.to_string(), content, mode: meta.permissions().mode(),
+        }));
+    }
+    let (file_count, total_bytes) = count_dir_contents(source).await?;
+    if file_count < 50 && total_bytes < 10 * 1024 * 1024 {
+        return Ok(BindMountResult::Tmpfs(collect_dir_files(source).await?));
+    }
+    self.handle_bind_mount_blk(source, target, container_id, read_only).await?;
+    Ok(BindMountResult::Block)
+}
+```
 
 ### 4.3 沙箱配置文件（resolv.conf / hosts / hostname）
 
@@ -463,17 +517,29 @@ pub struct RestoreSource {
 
 ### 5.2 Cloud Hypervisor 实现
 
-**Snapshot**：
+**Snapshot**（含一致性保障）：
 
 ```rust
 impl Snapshottable for CloudHypervisorVM {
     async fn snapshot(&self, dest_dir: &Path) -> Result<SnapshotMeta> {
         tokio::fs::create_dir_all(dest_dir).await?;
-        // PUT /api/v1/vm.snapshot
-        // CH 将 RAM、CPU 状态、设备状态写入 dest_dir
-        // pmem DAX 区域不包含在内（pmem 本身是持久的）
+
+        // 1. Guest sync：确保 ext4 journal 全部提交到块设备
+        //    通过 TTRPC 在 guest 内执行 sync，避免未提交写入被 snapshot 截断
+        self.exec_in_guest(&["sync"]).await?;
+
+        // 2. Pause VM：冻结 CPU + 所有设备队列，确保 snapshot 原子一致
+        //    pause 后 VM 不再接受新 I/O，journal 不会再变化
+        self.api_call("PUT", "vm.pause", &json!({})).await?;
+
+        // 3. 捕获 snapshot（pmem DAX 区域不包含在内，pmem 本身是持久的）
         let body = json!({ "destination_url": format!("file://{}", dest_dir.display()) });
-        self.api_call("PUT", "vm.snapshot", &body).await?;
+        let snap_result = self.api_call("PUT", "vm.snapshot", &body).await;
+
+        // 4. 无论 snapshot 成功与否，立即 resume，避免模板 VM 被永久 pause
+        self.api_call("PUT", "vm.resume", &json!({})).await?;
+
+        snap_result?;
         Ok(SnapshotMeta { snapshot_dir: dest_dir.to_path_buf(), ..Default::default() })
     }
 ```
@@ -514,21 +580,47 @@ impl Snapshottable for CloudHypervisorVM {
 
 ### 5.3 config.json 路径 patch
 
-Restore 时，task.vsock 路径须替换为新 sandbox 专属路径，pmem 路径保持不变：
+Restore 时需将 config.json 中的 sandbox 专属路径替换为新 sandbox 的实际路径。**不使用字符串全文替换**（fragile，路径前缀相似时易误替换）；改为解析为 JSON 后按已知结构字段精确更新：
 
 ```rust
-// 模板创建时将 config.json 中 sandbox 专属路径替换为占位符
-// restore 时再将占位符替换回实际路径
+/// Restore 时需要 patch 的字段（仅 sandbox 专属路径，pmem 路径不动）
+pub struct SnapshotPathOverrides {
+    pub task_vsock: String,    // 新 sandbox 的 hvsock 文件路径
+    pub console_path: String,  // 新 sandbox 的 console log 路径
+}
 
-const PLACEHOLDER_TASK_VSOCK: &str = "##TASK_VSOCK##";
+/// 解析 JSON → 精确字段更新 → 序列化写出，避免字符串替换误伤
+async fn patch_snapshot_config(
+    src: &Path, dst: &Path, overrides: &SnapshotPathOverrides,
+) -> Result<()> {
+    let content = tokio::fs::read_to_string(src).await?;
+    let mut cfg: serde_json::Value = serde_json::from_str(&content)
+        .map_err(|e| anyhow!("parse config.json: {}", e))?;
 
-async fn patch_snapshot_config(src: &Path, dst: &Path,
-    overrides: &HashMap<String, String>) -> Result<()> {
-    let mut content = tokio::fs::read_to_string(src).await?;
-    for (k, v) in overrides {
-        content = content.replace(k.as_str(), v.as_str());
+    // CH config.json 结构（payload.vsock.socket_path）
+    if let Some(v) = cfg.pointer_mut("/payload/vsock/socket_path") {
+        *v = json!(overrides.task_vsock);
+    } else {
+        // vsock 字段缺失说明 config.json 结构变化，及早报错而非静默跳过
+        return Err(anyhow!("config.json missing /payload/vsock/socket_path"));
     }
-    write_file_atomic(dst, &content).await
+
+    if let Some(v) = cfg.pointer_mut("/payload/console/file") {
+        *v = json!(overrides.console_path);
+    }
+    // pmem 路径（/payload/pmem[0]/file）：模板共享，不替换
+
+    write_file_atomic(dst, &serde_json::to_string_pretty(&cfg)?).await
+}
+```
+
+模板创建时记录原始路径（用于生成 overrides），无需在 config.json 中写占位符：
+
+```rust
+pub struct TemplateMeta {
+    // ...（其余字段不变）
+    pub original_task_vsock: String,   // 模板创建时的 hvsock 路径，restore 时用作 override key
+    pub original_console_path: String,
 }
 ```
 
@@ -696,11 +788,11 @@ CreateContainer(spec)
 | 周次 | 任务 | 关键文件 |
 |------|------|---------|
 | W1 | `create_ext4_image()` / `copy_dir_to_ext4()` 工具函数；`handle_overlay_mount_blk()` | `storage/mod.rs` |
-| W1 | `handle_bind_mount_blk()`（目录型）；`attach_storage()` 分发 | `storage/mod.rs` |
-| W2 | Guest task agent 新增 `virtio-blk` 分支；`late_init_call` 适配 | `vmm/task/src/main.rs` |
+| W1 | `attach_bind_mount()` 分类逻辑（单文件→TTRPC注入，小目录→tmpfs，大目录→blk）；`attach_storage()` 分发 | `storage/mod.rs` |
+| W2 | Guest task agent 新增 `virtio-blk` 分支；`late_init_call` 适配；`inject_small_dir()` 实现 | `vmm/task/src/main.rs` |
 | W2 | `SetupSandboxRequest` 扩展（sandbox_files 字段）；host 侧推送 resolv.conf 等 | `sandbox.proto` / `sandbox.rs` |
 | W3 | `factory.rs` 条件移除 Fs 设备；`config.rs` 修改默认 kernel params | `factory.rs` / `config.rs` |
-| W3 | 端到端验证：容器创建 → virtio-blk storage → guest 挂载正常 | e2e test |
+| W3 | 端到端验证：容器创建 → virtio-blk storage → guest 挂载正常；ConfigMap 文件注入验证 | e2e test |
 
 **验收标准：**
 - 不启动 virtiofsd，容器能正常运行（rootfs 可访问，网络配置正确）
@@ -710,9 +802,9 @@ CreateContainer(spec)
 
 | 周次 | 任务 | 产出 |
 |------|------|------|
-| W4 | `Snapshottable` trait；`ChClient.vm_snapshot()` / `vm_restore()` | trait + API 封装 |
-| W5 | `patch_snapshot_config()`；restore work_dir 准备（symlink memory-ranges）| 路径 patch 逻辑 |
-| W6 | `CloudHypervisorVM::snapshot()` / `restore()` 完整实现；`launch_for_restore()` | 端到端 snapshot → restore |
+| W4 | `Snapshottable` trait；`ChClient.vm_snapshot()` / `vm_pause()` / `vm_resume()` / `vm_restore()` | trait + API 封装 |
+| W5 | `patch_snapshot_config()`（JSON 结构化 patch，`SnapshotPathOverrides`）；restore work_dir 准备 | 路径 patch 逻辑 |
+| W6 | `CloudHypervisorVM::snapshot()`（含 pause/sync/resume 一致性保障）/ `restore()` 完整实现 | 端到端 snapshot → restore |
 | W7 | 单 sandbox 端到端测试；restore 耗时基准；错误处理与冷启动回退 | 性能数据 |
 
 **验收标准：**
