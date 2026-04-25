@@ -22,8 +22,7 @@ use crate::vm::HypervisorCommonConfig;
 const DEFAULT_KERNEL_PARAMS: &str = "console=hvc0 \
 root=/dev/pmem0p1 \
 rootflags=data=ordered,errors=remount-ro \
-ro rootfstype=ext4 \
-task.sharefs_type=virtiofs";
+ro rootfstype=ext4";
 
 #[derive(Deserialize)]
 pub struct CloudHypervisorVMConfig {
@@ -34,6 +33,18 @@ pub struct CloudHypervisorVMConfig {
     pub entropy_source: String,
     pub task: TaskConfig,
     pub virtiofsd: VirtiofsdConfig,
+    #[serde(default)]
+    pub sharefs_type: String,
+}
+
+impl CloudHypervisorVMConfig {
+    pub fn sharefs_type(&self) -> &str {
+        if self.sharefs_type.is_empty() {
+            "virtio-blk"
+        } else {
+            &self.sharefs_type
+        }
+    }
 }
 
 impl Default for CloudHypervisorVMConfig {
@@ -45,6 +56,7 @@ impl Default for CloudHypervisorVMConfig {
             entropy_source: "/dev/urandom".to_string(),
             task: TaskConfig::default(),
             virtiofsd: VirtiofsdConfig::default(),
+            sharefs_type: String::new(),
         }
     }
 }
@@ -159,8 +171,10 @@ impl CloudHypervisorConfig {
             vm_config.hugepages,
         );
         let mut cmdline = format!(
-            "{} {}",
-            DEFAULT_KERNEL_PARAMS, vm_config.common.kernel_params
+            "{} task.sharefs_type={} {}",
+            DEFAULT_KERNEL_PARAMS,
+            vm_config.sharefs_type(),
+            vm_config.common.kernel_params
         );
 
         if vm_config.task.debug {
@@ -236,7 +250,7 @@ mod tests {
         assert_eq!(params[6], "--kernel");
         assert_eq!(params[7], "/path/to/kernel");
         assert_eq!(params[8], "--cmdline");
-        assert_eq!(params[9], "task.sharefs_type=virtiofs");
+        assert_eq!(params[9], "task.sharefs_type=virtiofs"); // cmdline field set directly, not via DEFAULT_KERNEL_PARAMS
     }
 
     #[test]
@@ -307,6 +321,6 @@ thread_pool_size = 4
         let config: Config<CloudHypervisorVMConfig> = toml::from_str(toml_str).unwrap();
         let chc = CloudHypervisorConfig::from(&config.hypervisor);
 
-        assert_eq!(chc.cmdline, "console=hvc0 root=/dev/pmem0p1 rootflags=data=ordered,errors=remount-ro ro rootfstype=ext4 task.sharefs_type=virtiofs  task.log_level=debug task.enable_tracing=false");
+        assert_eq!(chc.cmdline, "console=hvc0 root=/dev/pmem0p1 rootflags=data=ordered,errors=remount-ro ro rootfstype=ext4 task.sharefs_type=virtio-blk  task.log_level=debug task.enable_tracing=false");
     }
 }

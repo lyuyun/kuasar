@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{collections::HashMap, io::ErrorKind, path::Path};
+use std::{collections::HashMap, io::ErrorKind, path::Path, time::Duration};
 
 use anyhow::anyhow;
 use containerd_sandbox::{
@@ -22,10 +22,12 @@ use containerd_sandbox::{
     spec::Mount,
 };
 use containerd_shim::mount::mount_rootfs;
-use log::debug;
+use log::{debug, warn};
 use nix::libc::MNT_DETACH;
 pub use utils::*;
+use ttrpc::context::with_timeout;
 use vmm_common::{
+    api::sandbox::ExecVMProcessRequest,
     mount::{bind_mount, unmount, MNT_NOFOLLOW},
     storage::{Storage, DRIVEREPHEMERALTYPE},
     KUASAR_STATE_DIR,
@@ -37,6 +39,8 @@ use crate::{
     storage::mount::{get_mount_info, is_bind, is_bind_shm, is_overlay},
     vm::{BlockDriver, VM},
 };
+
+const DRIVER_GUEST_FILE: &str = "guest-file";
 
 pub mod mount;
 pub mod utils;
@@ -80,12 +84,20 @@ where
         }
 
         if is_bind(m) {
-            self.handle_bind_mount(&id, container_id, m).await?;
+            if self.vm.sharefs_type() == "virtio-blk" {
+                self.handle_bind_mount_blk(&id, container_id, m).await?;
+            } else {
+                self.handle_bind_mount(&id, container_id, m).await?;
+            }
             return Ok(());
         }
 
         if is_overlay(m) {
-            self.handle_overlay_mount(&id, container_id, m).await?;
+            if self.vm.sharefs_type() == "virtio-blk" {
+                self.handle_overlay_mount_blk(&id, container_id, m).await?;
+            } else {
+                self.handle_overlay_mount(&id, container_id, m).await?;
+            }
             return Ok(());
         }
 
@@ -322,8 +334,17 @@ where
         id: &str,
         fs_type: &str,
     ) -> Result<()> {
-        if device_id.is_some() {
-            self.vm.hot_detach(&device_id.unwrap()).await?;
+        if let Some(did) = device_id {
+            self.vm.hot_detach(&did).await?;
+            // Clean up the backing ext4 image created for virtio-blk container layers
+            if fs_type == "ext4" {
+                let img_path = format!("{}/{}.img", self.base_dir, id);
+                if let Err(e) = tokio::fs::remove_file(&img_path).await {
+                    if e.kind() != ErrorKind::NotFound {
+                        warn!("failed to remove ext4 image {}: {}", img_path, e);
+                    }
+                }
+            }
         } else if fs_type == "bind" {
             let mount_point = format!("{}/{}", self.get_sandbox_shared_path(), &id);
             unmount(&mount_point, MNT_DETACH | MNT_NOFOLLOW)?;
@@ -346,6 +367,7 @@ where
                 }
             }
         }
+        // DRIVER_GUEST_FILE type: file pushed to guest, no host-side resource to clean up
         Ok(())
     }
 
@@ -357,6 +379,304 @@ where
         }
         self.gc_storages().await?;
         Ok(())
+    }
+
+    // --- virtio-blk container layer handlers ---
+
+    async fn handle_overlay_mount_blk(
+        &mut self,
+        storage_id: &str,
+        container_id: &str,
+        m: &Mount,
+    ) -> Result<()> {
+        if m.source.is_empty() {
+            return Err(Error::InvalidArgument(format!(
+                "mount source should exist for overlay mount {:?}",
+                m
+            )));
+        }
+
+        // Step 1: mount overlay on host to a temporary directory
+        let overlay_dir = format!("{}/overlay-{}", self.base_dir, storage_id);
+        tokio::fs::create_dir_all(&overlay_dir).await?;
+        mount_rootfs(Some(&m.r#type), Some(&m.source), &m.options, &overlay_dir)
+            .map_err(|e| anyhow!("mount overlay for blk: {}", e))?;
+
+        // Steps 2-4: create ext4 image and copy overlay content into it
+        let img_path = format!("{}/{}.img", self.base_dir, storage_id);
+        let prepare_result = async {
+            let size_mb = estimate_dir_size_mb(&overlay_dir).await.unwrap_or(64) * 12 / 10 + 64;
+            create_ext4_image(&img_path, size_mb).await?;
+            copy_dir_to_ext4(&overlay_dir, &img_path).await
+        }
+        .await;
+
+        // Step 5: always unmount the host overlay regardless of result
+        if let Err(e) = unmount(&overlay_dir, MNT_DETACH | MNT_NOFOLLOW) {
+            warn!("failed to unmount overlay {}: {}", overlay_dir, e);
+        }
+        let _ = tokio::fs::remove_dir(&overlay_dir).await;
+
+        if let Err(e) = prepare_result {
+            let _ = tokio::fs::remove_file(&img_path).await;
+            return Err(e);
+        }
+
+        // Step 6: hot-attach ext4 image as virtio-blk
+        let read_only = m.options.contains(&"ro".to_string());
+        let device_id = format!("blk{}", self.increment_and_get_id());
+        let hot_result = self
+            .vm
+            .hot_attach(DeviceInfo::Block(BlockDeviceInfo {
+                id: device_id.clone(),
+                path: img_path.clone(),
+                read_only,
+            }))
+            .await;
+
+        let (bus_type, pci_addr) = match hot_result {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = tokio::fs::remove_file(&img_path).await;
+                return Err(e);
+            }
+        };
+
+        // Step 7: record storage entry (need_guest_handle=true, guest mounts via PCI addr)
+        let options = if read_only {
+            vec!["ro".to_string()]
+        } else {
+            vec![]
+        };
+        let mut storage = Storage {
+            host_source: m.source.clone(),
+            r#type: m.r#type.clone(),
+            id: storage_id.to_string(),
+            device_id: Some(device_id),
+            ref_container: HashMap::new(),
+            need_guest_handle: true,
+            source: pci_addr,
+            driver: BlockDriver::from_bus_type(&bus_type).to_driver_string(),
+            driver_options: vec![],
+            fstype: "ext4".to_string(),
+            options,
+            mount_point: format!("{}{}", KUASAR_GUEST_SHARE_DIR, storage_id),
+        };
+        storage.refer(container_id);
+        self.storages.push(storage);
+        Ok(())
+    }
+
+    async fn handle_bind_mount_blk(
+        &mut self,
+        storage_id: &str,
+        container_id: &str,
+        m: &Mount,
+    ) -> Result<()> {
+        let source = if m.source.is_empty() {
+            return Err(Error::InvalidArgument(format!(
+                "mount source should exist for bind mount {:?}",
+                m
+            )));
+        } else {
+            m.source.clone()
+        };
+
+        let read_only = m.options.contains(&"ro".to_string());
+        let meta = tokio::fs::metadata(&source)
+            .await
+            .map_err(|e| anyhow!("stat {}: {}", source, e))?;
+
+        if meta.is_file() {
+            // Single file: push content to guest via TTRPC exec_vm_process
+            let content = tokio::fs::read(&source)
+                .await
+                .map_err(|e| anyhow!("read {}: {}", source, e))?;
+            let dest_in_guest = format!("{}/{}", KUASAR_STATE_DIR, storage_id);
+            self.push_file_to_guest(&dest_in_guest, content).await?;
+
+            let options = if read_only {
+                vec!["ro".to_string()]
+            } else {
+                vec![]
+            };
+            let mut storage = Storage {
+                host_source: source.clone(),
+                r#type: m.r#type.clone(),
+                id: storage_id.to_string(),
+                device_id: None,
+                ref_container: HashMap::new(),
+                need_guest_handle: false,
+                source: "".to_string(),
+                driver: DRIVER_GUEST_FILE.to_string(),
+                driver_options: vec![],
+                fstype: "bind".to_string(),
+                options,
+                mount_point: dest_in_guest,
+            };
+            storage.refer(container_id);
+            self.storages.push(storage);
+        } else {
+            // Directory: create ext4 image, rsync content, hot-attach
+            let img_path = format!("{}/{}.img", self.base_dir, storage_id);
+            let size_mb = estimate_dir_size_mb(&source).await.unwrap_or(8) * 12 / 10 + 8;
+            let prepare_result = async {
+                create_ext4_image(&img_path, size_mb).await?;
+                copy_dir_to_ext4(&source, &img_path).await
+            }
+            .await;
+
+            if let Err(e) = prepare_result {
+                let _ = tokio::fs::remove_file(&img_path).await;
+                return Err(e);
+            }
+
+            let device_id = format!("blk{}", self.increment_and_get_id());
+            let hot_result = self
+                .vm
+                .hot_attach(DeviceInfo::Block(BlockDeviceInfo {
+                    id: device_id.clone(),
+                    path: img_path.clone(),
+                    read_only,
+                }))
+                .await;
+
+            let (bus_type, pci_addr) = match hot_result {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = tokio::fs::remove_file(&img_path).await;
+                    return Err(e);
+                }
+            };
+
+            let options = if read_only {
+                vec!["ro".to_string()]
+            } else {
+                vec![]
+            };
+            let mut storage = Storage {
+                host_source: source.clone(),
+                r#type: m.r#type.clone(),
+                id: storage_id.to_string(),
+                device_id: Some(device_id),
+                ref_container: HashMap::new(),
+                need_guest_handle: true,
+                source: pci_addr,
+                driver: BlockDriver::from_bus_type(&bus_type).to_driver_string(),
+                driver_options: vec![],
+                fstype: "ext4".to_string(),
+                options,
+                mount_point: format!("{}{}", KUASAR_GUEST_SHARE_DIR, storage_id),
+            };
+            storage.refer(container_id);
+            self.storages.push(storage);
+        }
+        Ok(())
+    }
+
+    async fn push_file_to_guest(&self, dest_path: &str, content: Vec<u8>) -> Result<()> {
+        let client_guard = self.client.lock().await;
+        if let Some(client) = client_guard.as_ref() {
+            let timeout_ns = Duration::from_secs(10).as_nanos() as i64;
+            let parent = Path::new(dest_path)
+                .parent()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|| "/tmp".to_string());
+            let mut req = ExecVMProcessRequest::new();
+            req.command = format!("mkdir -p {} && tee {}", parent, dest_path);
+            req.stdin = content;
+            client
+                .exec_vm_process(with_timeout(timeout_ns), &req)
+                .await
+                .map_err(|e| anyhow!("push file to guest at {}: {}", dest_path, e))?;
+        }
+        Ok(())
+    }
+}
+
+async fn estimate_dir_size_mb(dir: &str) -> Result<u64> {
+    let output = tokio::process::Command::new("du")
+        .args(["-sm", dir])
+        .output()
+        .await
+        .map_err(|e| anyhow!("du -sm {}: {}", dir, e))?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let size_mb = stdout
+        .split_whitespace()
+        .next()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(64);
+    Ok(size_mb)
+}
+
+async fn create_ext4_image(path: &str, size_mb: u64) -> Result<()> {
+    // Create sparse file
+    let file = tokio::fs::File::create(path)
+        .await
+        .map_err(|e| anyhow!("create ext4 image {}: {}", path, e))?;
+    file.set_len(size_mb * 1024 * 1024)
+        .await
+        .map_err(|e| anyhow!("set ext4 image size: {}", e))?;
+    drop(file);
+
+    // Format as ext4 without journal for faster creation
+    let status = tokio::process::Command::new("mkfs.ext4")
+        .args([
+            "-F",
+            "-O",
+            "^has_journal",
+            "-E",
+            "lazy_itable_init=0,lazy_journal_init=0",
+            path,
+        ])
+        .status()
+        .await
+        .map_err(|e| anyhow!("mkfs.ext4 {}: {}", path, e))?;
+    if !status.success() {
+        return Err(anyhow!("mkfs.ext4 failed for {}: {:?}", path, status).into());
+    }
+    Ok(())
+}
+
+async fn copy_dir_to_ext4(src_dir: &str, img_path: &str) -> Result<()> {
+    let mnt_dir = format!("{}.mnt", img_path);
+    tokio::fs::create_dir_all(&mnt_dir)
+        .await
+        .map_err(|e| anyhow!("create mnt dir {}: {}", mnt_dir, e))?;
+
+    // Loop-mount the ext4 image
+    let mount_status = tokio::process::Command::new("mount")
+        .args(["-o", "loop", img_path, &mnt_dir])
+        .status()
+        .await
+        .map_err(|e| anyhow!("mount loop {}: {}", img_path, e))?;
+    if !mount_status.success() {
+        let _ = tokio::fs::remove_dir(&mnt_dir).await;
+        return Err(anyhow!("mount loop failed for {}: {:?}", img_path, mount_status).into());
+    }
+
+    // rsync source into the mounted ext4
+    let rsync_status = tokio::process::Command::new("rsync")
+        .args([
+            "-aHAX",
+            "--delete",
+            &format!("{}/", src_dir),
+            &format!("{}/", mnt_dir),
+        ])
+        .status()
+        .await;
+
+    // Always unmount regardless of rsync result
+    let _ = tokio::process::Command::new("umount")
+        .arg(&mnt_dir)
+        .status()
+        .await;
+    let _ = tokio::fs::remove_dir(&mnt_dir).await;
+
+    match rsync_status {
+        Ok(s) if s.success() => Ok(()),
+        Ok(s) => Err(anyhow!("rsync to ext4 failed: {:?}", s).into()),
+        Err(e) => Err(anyhow!("rsync to ext4: {}", e).into()),
     }
 }
 

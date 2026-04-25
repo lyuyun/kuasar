@@ -64,6 +64,7 @@ pub struct CloudHypervisorVM {
     base_dir: String,
     agent_socket: String,
     virtiofsd_config: VirtiofsdConfig,
+    sharefs_type: String,
     #[serde(skip)]
     wait_chan: Option<Receiver<(u32, i128)>>,
     #[serde(skip)]
@@ -81,9 +82,13 @@ impl CloudHypervisorVM {
             config.initramfs = Some(vm_config.common.initrd_path.clone());
         }
 
+        let sharefs_type = vm_config.sharefs_type().to_string();
         let mut virtiofsd_config = vm_config.virtiofsd.clone();
-        virtiofsd_config.socket_path = format!("{}/virtiofs.sock", base_dir);
-        virtiofsd_config.shared_dir = format!("{}/{}", base_dir, SHARED_DIR_SUFFIX);
+        // Only configure virtiofsd when using virtiofs sharefs type
+        if sharefs_type == "virtiofs" {
+            virtiofsd_config.socket_path = format!("{}/virtiofs.sock", base_dir);
+            virtiofsd_config.shared_dir = format!("{}/{}", base_dir, SHARED_DIR_SUFFIX);
+        }
         Self {
             id: id.to_string(),
             config,
@@ -92,6 +97,7 @@ impl CloudHypervisorVM {
             base_dir: base_dir.to_string(),
             agent_socket: "".to_string(),
             virtiofsd_config,
+            sharefs_type,
             wait_chan: None,
             client: None,
             fds: vec![],
@@ -161,9 +167,11 @@ impl VM for CloudHypervisorVM {
     #[instrument(skip_all)]
     async fn start(&mut self) -> Result<u32> {
         create_dir_all(&self.base_dir).await?;
-        let virtiofsd_pid = self.start_virtiofsd().await?;
-        // TODO: add child virtiofsd process
-        self.pids.affiliated_pids.push(virtiofsd_pid);
+        // Only start virtiofsd when sharefs_type is virtiofs
+        if self.sharefs_type == "virtiofs" {
+            let virtiofsd_pid = self.start_virtiofsd().await?;
+            self.pids.affiliated_pids.push(virtiofsd_pid);
+        }
         let mut params = self.config.to_cmdline_params("--");
         for d in self.devices.iter() {
             params.extend(d.to_cmdline_params("--"));
@@ -339,6 +347,10 @@ impl VM for CloudHypervisorVM {
     #[instrument(skip_all)]
     fn pids(&self) -> Pids {
         self.pids.clone()
+    }
+
+    fn sharefs_type(&self) -> &str {
+        &self.sharefs_type
     }
 }
 

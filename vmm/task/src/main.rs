@@ -164,8 +164,16 @@ async fn initialize() -> anyhow::Result<TaskConfig> {
         "virtiofs" => {
             mount_static_mounts(SHAREFS_VIRTIOFS_MOUNTS.clone()).await?;
         }
+        "virtio-blk" => {
+            // No shared fs in virtio-blk mode.
+            // Create KUASAR_STATE_DIR so the host can push files here via exec_vm_process.
+            tokio::fs::create_dir_all(KUASAR_STATE_DIR)
+                .await
+                .map_err(io_error!(e, "create kuasar state dir for virtio-blk"))?;
+            info!("virtio-blk sharefs mode, skipping shared fs mount");
+        }
         _ => {
-            warn!("sharefs_type should be either 9p or virtiofs");
+            warn!("unsupported sharefs_type: {}", config.sharefs_type);
         }
     }
     if config.debug {
@@ -175,7 +183,7 @@ async fn initialize() -> anyhow::Result<TaskConfig> {
         }
     }
 
-    late_init_call().await?;
+    late_init_call(&config).await?;
 
     Ok(config)
 }
@@ -378,8 +386,14 @@ async fn init_vm_rootfs() -> Result<()> {
 
 // Continue to do initialization that depend on shared path.
 // such as adding guest hook, preparing sandbox files and namespaces.
-async fn late_init_call() -> Result<()> {
-    // Setup DNS, bind mount to /etc/resolv.conf
+async fn late_init_call(config: &TaskConfig) -> Result<()> {
+    if config.sharefs_type == "virtio-blk" {
+        // In virtio-blk mode resolv.conf is pushed directly by the host via exec_vm_process.
+        // No bind mount from shared dir is needed.
+        return Ok(());
+    }
+
+    // For virtiofs/9p: bind-mount resolv.conf from the shared state dir to /etc/resolv.conf
     let dns_file = Path::new(KUASAR_STATE_DIR).join(RESOLV_FILENAME);
     if dns_file.exists() {
         nix::mount::mount(

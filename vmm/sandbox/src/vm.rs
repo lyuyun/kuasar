@@ -71,6 +71,9 @@ pub trait VM: Serialize + Sync + Send {
     async fn wait_channel(&self) -> Option<Receiver<(u32, i128)>>;
     async fn vcpus(&self) -> Result<VcpuThreads>;
     fn pids(&self) -> Pids;
+    fn sharefs_type(&self) -> &str {
+        "virtiofs"
+    }
 }
 
 #[macro_export]

@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{collections::HashMap, io::ErrorKind, path::Path, sync::Arc, time::Instant};
+use std::{collections::HashMap, io::ErrorKind, path::Path, sync::Arc, time::{Duration, Instant}};
 
 use anyhow::anyhow;
 use async_trait::async_trait;
@@ -38,9 +38,14 @@ use tokio::{
 use tracing::instrument;
 use ttrpc::context::with_timeout;
 use vmm_common::{
-    api::{empty::Empty, sandbox::SetupSandboxRequest, sandbox_ttrpc::SandboxServiceClient},
+    api::{
+        empty::Empty,
+        sandbox::{ExecVMProcessRequest, SetupSandboxRequest},
+        sandbox_ttrpc::SandboxServiceClient,
+    },
     storage::Storage,
-    ETC_HOSTS, ETC_RESOLV, HOSTNAME_FILENAME, HOSTS_FILENAME, RESOLV_FILENAME, SHARED_DIR_SUFFIX,
+    ETC_HOSTS, ETC_RESOLV, HOSTNAME_FILENAME, HOSTS_FILENAME, KUASAR_STATE_DIR, RESOLV_FILENAME,
+    SHARED_DIR_SUFFIX,
 };
 
 use crate::{
@@ -550,6 +555,18 @@ where
             return Err(e);
         }
 
+        // In virtio-blk mode there is no virtiofs to share sandbox config files.
+        // Push them into the guest before setup_sandbox() which reads the hostname.
+        if self.vm.sharefs_type() == "virtio-blk" {
+            if let Err(e) = self.push_sandbox_files().await {
+                if let Err(re) = self.vm.stop(true).await {
+                    warn!("roll back in push sandbox files: {}", re);
+                    return Err(e);
+                }
+                return Err(e);
+            }
+        }
+
         if let Err(e) = self.setup_sandbox().await {
             if let Err(re) = self.vm.stop(true).await {
                 error!("roll back in setup sandbox client: {}", re);
@@ -757,6 +774,74 @@ where
     #[instrument(skip_all)]
     pub fn get_sandbox_shared_path(&self) -> String {
         format!("{}/{}", self.base_dir, SHARED_DIR_SUFFIX)
+    }
+
+    // Push sandbox config files (hostname, resolv.conf, hosts) directly into the guest
+    // via exec_vm_process TTRPC calls. Used in virtio-blk mode where there is no virtiofs.
+    #[instrument(skip_all)]
+    async fn push_sandbox_files(&self) -> Result<()> {
+        let shared_path = self.get_sandbox_shared_path();
+        let client_guard = self.client.lock().await;
+        let client = match client_guard.as_ref() {
+            Some(c) => c,
+            None => return Ok(()),
+        };
+        let timeout_ns = Duration::from_secs(10).as_nanos() as i64;
+
+        // Ensure KUASAR_STATE_DIR exists in the guest so containers can bind-mount from it
+        let mut req = ExecVMProcessRequest::new();
+        req.command = format!("mkdir -p {}", KUASAR_STATE_DIR);
+        req.stdin = vec![];
+        client
+            .exec_vm_process(with_timeout(timeout_ns), &req)
+            .await
+            .map_err(|e| anyhow!("create kuasar state dir in guest: {}", e))?;
+
+        // Push hostname to KUASAR_STATE_DIR so setup_sandbox() can read it
+        let hostname_host = format!("{}/{}", shared_path, HOSTNAME_FILENAME);
+        if let Ok(content) = tokio::fs::read(&hostname_host).await {
+            let mut req = ExecVMProcessRequest::new();
+            req.command = format!("tee {}/{}", KUASAR_STATE_DIR, HOSTNAME_FILENAME);
+            req.stdin = content;
+            client
+                .exec_vm_process(with_timeout(timeout_ns), &req)
+                .await
+                .map_err(|e| anyhow!("push hostname to guest: {}", e))?;
+        }
+
+        // Push resolv.conf both to KUASAR_STATE_DIR and /etc/resolv.conf
+        let resolv_host = format!("{}/{}", shared_path, RESOLV_FILENAME);
+        if let Ok(content) = tokio::fs::read(&resolv_host).await {
+            let mut req = ExecVMProcessRequest::new();
+            req.command = format!("tee {}/{}", KUASAR_STATE_DIR, RESOLV_FILENAME);
+            req.stdin = content.clone();
+            client
+                .exec_vm_process(with_timeout(timeout_ns), &req)
+                .await
+                .map_err(|e| anyhow!("push resolv.conf to state dir: {}", e))?;
+
+            let mut req2 = ExecVMProcessRequest::new();
+            req2.command = "tee /etc/resolv.conf".to_string();
+            req2.stdin = content;
+            client
+                .exec_vm_process(with_timeout(timeout_ns), &req2)
+                .await
+                .map_err(|e| anyhow!("push resolv.conf to /etc: {}", e))?;
+        }
+
+        // Push hosts to KUASAR_STATE_DIR for containers that bind-mount from there
+        let hosts_host = format!("{}/{}", shared_path, HOSTS_FILENAME);
+        if let Ok(content) = tokio::fs::read(&hosts_host).await {
+            let mut req = ExecVMProcessRequest::new();
+            req.command = format!("tee {}/{}", KUASAR_STATE_DIR, HOSTS_FILENAME);
+            req.stdin = content;
+            client
+                .exec_vm_process(with_timeout(timeout_ns), &req)
+                .await
+                .map_err(|e| anyhow!("push hosts to guest: {}", e))?;
+        }
+
+        Ok(())
     }
 
     #[instrument(skip_all)]
