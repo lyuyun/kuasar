@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{collections::HashMap, io::ErrorKind, path::Path, time::Duration};
+use std::{collections::HashMap, io::ErrorKind, os::unix::fs::PermissionsExt, path::Path, time::Duration};
 
 use anyhow::anyhow;
 use containerd_sandbox::{
@@ -37,10 +37,13 @@ use crate::{
     device::{BlockDeviceInfo, DeviceInfo},
     sandbox::{KuasarSandbox, KUASAR_GUEST_SHARE_DIR},
     storage::mount::{get_mount_info, is_bind, is_bind_shm, is_overlay},
-    vm::{BlockDriver, VM},
+    vm::{BlockDriver, SHAREFS_VIRTIO_BLK, VM},
 };
 
 const DRIVER_GUEST_FILE: &str = "guest-file";
+// Small-directory threshold: inject files via TTRPC instead of creating a block device
+const SMALL_DIR_MAX_FILES: usize = 50;
+const SMALL_DIR_MAX_BYTES: u64 = 10 * 1024 * 1024;
 
 pub mod mount;
 pub mod utils;
@@ -84,7 +87,7 @@ where
         }
 
         if is_bind(m) {
-            if self.vm.sharefs_type() == "virtio-blk" {
+            if self.vm.sharefs_type() == SHAREFS_VIRTIO_BLK {
                 self.handle_bind_mount_blk(&id, container_id, m).await?;
             } else {
                 self.handle_bind_mount(&id, container_id, m).await?;
@@ -93,7 +96,7 @@ where
         }
 
         if is_overlay(m) {
-            if self.vm.sharefs_type() == "virtio-blk" {
+            if self.vm.sharefs_type() == SHAREFS_VIRTIO_BLK {
                 self.handle_overlay_mount_blk(&id, container_id, m).await?;
             } else {
                 self.handle_overlay_mount(&id, container_id, m).await?;
@@ -415,7 +418,7 @@ where
         if let Err(e) = unmount(&overlay_dir, MNT_DETACH | MNT_NOFOLLOW) {
             warn!("failed to unmount overlay {}: {}", overlay_dir, e);
         }
-        let _ = tokio::fs::remove_dir(&overlay_dir).await;
+        let _ = tokio::fs::remove_dir_all(&overlay_dir).await;
 
         if let Err(e) = prepare_result {
             let _ = tokio::fs::remove_file(&img_path).await;
@@ -489,11 +492,12 @@ where
 
         if meta.is_file() {
             // Single file: push content to guest via TTRPC exec_vm_process
+            let mode = meta.permissions().mode() & 0o777;
             let content = tokio::fs::read(&source)
                 .await
                 .map_err(|e| anyhow!("read {}: {}", source, e))?;
             let dest_in_guest = format!("{}/{}", KUASAR_STATE_DIR, storage_id);
-            self.push_file_to_guest(&dest_in_guest, content).await?;
+            self.push_file_to_guest(&dest_in_guest, content, mode).await?;
 
             let options = if read_only {
                 vec!["ro".to_string()]
@@ -517,64 +521,161 @@ where
             storage.refer(container_id);
             self.storages.push(storage);
         } else {
-            // Directory: create ext4 image, rsync content, hot-attach
-            let img_path = format!("{}/{}.img", self.base_dir, storage_id);
-            let size_mb = estimate_dir_size_mb(&source).await.unwrap_or(8) * 12 / 10 + 8;
-            let prepare_result = async {
-                create_ext4_image(&img_path, size_mb).await?;
-                copy_dir_to_ext4(&source, &img_path).await
-            }
-            .await;
-
-            if let Err(e) = prepare_result {
-                let _ = tokio::fs::remove_file(&img_path).await;
-                return Err(e);
-            }
-
-            let device_id = format!("blk{}", self.increment_and_get_id());
-            let hot_result = self
-                .vm
-                .hot_attach(DeviceInfo::Block(BlockDeviceInfo {
-                    id: device_id.clone(),
-                    path: img_path.clone(),
-                    read_only,
-                }))
+            // Directory: check size to choose between file injection and ext4 block device
+            let (file_count, total_bytes) = count_dir_contents(&source).await.unwrap_or((0, 0));
+            if file_count <= SMALL_DIR_MAX_FILES && total_bytes <= SMALL_DIR_MAX_BYTES {
+                // Small directory: inject each file via TTRPC (avoids creating an 8MB+ block device)
+                let dest_dir_in_guest = format!("{}/{}", KUASAR_STATE_DIR, storage_id);
+                self.inject_small_dir(storage_id, container_id, &source, &dest_dir_in_guest, m)
+                    .await?;
+            } else {
+                // Large directory (HostPath volumes etc.): ext4 image hot-attached as virtio-blk
+                let img_path = format!("{}/{}.img", self.base_dir, storage_id);
+                let size_mb = estimate_dir_size_mb(&source).await.unwrap_or(8) * 12 / 10 + 8;
+                let prepare_result = async {
+                    create_ext4_image(&img_path, size_mb).await?;
+                    copy_dir_to_ext4(&source, &img_path).await
+                }
                 .await;
 
-            let (bus_type, pci_addr) = match hot_result {
-                Ok(r) => r,
-                Err(e) => {
+                if let Err(e) = prepare_result {
                     let _ = tokio::fs::remove_file(&img_path).await;
                     return Err(e);
                 }
-            };
 
-            let options = if read_only {
-                vec!["ro".to_string()]
-            } else {
-                vec![]
-            };
-            let mut storage = Storage {
-                host_source: source.clone(),
-                r#type: m.r#type.clone(),
-                id: storage_id.to_string(),
-                device_id: Some(device_id),
-                ref_container: HashMap::new(),
-                need_guest_handle: true,
-                source: pci_addr,
-                driver: BlockDriver::from_bus_type(&bus_type).to_driver_string(),
-                driver_options: vec![],
-                fstype: "ext4".to_string(),
-                options,
-                mount_point: format!("{}{}", KUASAR_GUEST_SHARE_DIR, storage_id),
-            };
-            storage.refer(container_id);
-            self.storages.push(storage);
+                let device_id = format!("blk{}", self.increment_and_get_id());
+                let hot_result = self
+                    .vm
+                    .hot_attach(DeviceInfo::Block(BlockDeviceInfo {
+                        id: device_id.clone(),
+                        path: img_path.clone(),
+                        read_only,
+                    }))
+                    .await;
+
+                let (bus_type, pci_addr) = match hot_result {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let _ = tokio::fs::remove_file(&img_path).await;
+                        return Err(e);
+                    }
+                };
+
+                let options = if read_only {
+                    vec!["ro".to_string()]
+                } else {
+                    vec![]
+                };
+                let mut storage = Storage {
+                    host_source: source.clone(),
+                    r#type: m.r#type.clone(),
+                    id: storage_id.to_string(),
+                    device_id: Some(device_id),
+                    ref_container: HashMap::new(),
+                    need_guest_handle: true,
+                    source: pci_addr,
+                    driver: BlockDriver::from_bus_type(&bus_type).to_driver_string(),
+                    driver_options: vec![],
+                    fstype: "ext4".to_string(),
+                    options,
+                    mount_point: format!("{}{}", KUASAR_GUEST_SHARE_DIR, storage_id),
+                };
+                storage.refer(container_id);
+                self.storages.push(storage);
+            }
         }
         Ok(())
     }
 
-    async fn push_file_to_guest(&self, dest_path: &str, content: Vec<u8>) -> Result<()> {
+    // Inject a small directory's files into the guest one by one via TTRPC.
+    // Creates a directory at dest_dir_in_guest and pushes each file with its permissions.
+    async fn inject_small_dir(
+        &mut self,
+        storage_id: &str,
+        container_id: &str,
+        src_dir: &str,
+        dest_dir_in_guest: &str,
+        m: &Mount,
+    ) -> Result<()> {
+        // Create the destination dir in guest (dest_dir_in_guest is internally generated — safe)
+        validate_guest_path(dest_dir_in_guest)?;
+        self.exec_in_guest(&format!("mkdir -p {}", dest_dir_in_guest))
+            .await?;
+
+        // Walk the source dir and push each file
+        let mut stack = vec![src_dir.to_string()];
+        while let Some(dir) = stack.pop() {
+            let mut entries = tokio::fs::read_dir(&dir)
+                .await
+                .map_err(|e| anyhow!("read dir {}: {}", dir, e))?;
+            while let Some(entry) = entries
+                .next_entry()
+                .await
+                .map_err(|e| anyhow!("read entry in {}: {}", dir, e))?
+            {
+                let path = entry.path();
+                let rel = path
+                    .strip_prefix(src_dir)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .to_string();
+                let guest_path = format!("{}/{}", dest_dir_in_guest, rel);
+                let ft = entry
+                    .file_type()
+                    .await
+                    .map_err(|e| anyhow!("file_type {}: {}", path.display(), e))?;
+                if ft.is_dir() {
+                    self.exec_in_guest(&format!("mkdir -p {}", shell_quote(&guest_path)))
+                        .await?;
+                    stack.push(path.to_string_lossy().to_string());
+                } else if ft.is_file() {
+                    let meta = entry
+                        .metadata()
+                        .await
+                        .map_err(|e| anyhow!("metadata {}: {}", path.display(), e))?;
+                    let mode = meta.permissions().mode() & 0o777;
+                    let content = tokio::fs::read(&path)
+                        .await
+                        .map_err(|e| anyhow!("read {}: {}", path.display(), e))?;
+                    self.push_file_to_guest(&guest_path, content, mode).await?;
+                }
+                // symlinks and other types are skipped
+            }
+        }
+
+        let read_only = m.options.contains(&"ro".to_string());
+        let options = if read_only {
+            vec!["ro".to_string()]
+        } else {
+            vec![]
+        };
+        let mut storage = Storage {
+            host_source: src_dir.to_string(),
+            r#type: m.r#type.clone(),
+            id: storage_id.to_string(),
+            device_id: None,
+            ref_container: HashMap::new(),
+            need_guest_handle: false,
+            source: "".to_string(),
+            driver: DRIVER_GUEST_FILE.to_string(),
+            driver_options: vec![],
+            fstype: "bind".to_string(),
+            options,
+            mount_point: dest_dir_in_guest.to_string(),
+        };
+        storage.refer(container_id);
+        self.storages.push(storage);
+        Ok(())
+    }
+
+    // Push a single file to the guest at dest_path, preserving the given permissions.
+    // Paths are shell-quoted so they are safe even if they contain spaces or special characters.
+    async fn push_file_to_guest(
+        &self,
+        dest_path: &str,
+        content: Vec<u8>,
+        mode: u32,
+    ) -> Result<()> {
         let client_guard = self.client.lock().await;
         if let Some(client) = client_guard.as_ref() {
             let timeout_ns = Duration::from_secs(10).as_nanos() as i64;
@@ -582,8 +683,13 @@ where
                 .parent()
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_else(|| "/tmp".to_string());
+            let qparent = shell_quote(&parent);
+            let qdest = shell_quote(dest_path);
             let mut req = ExecVMProcessRequest::new();
-            req.command = format!("mkdir -p {} && tee {}", parent, dest_path);
+            req.command = format!(
+                "mkdir -p {} && tee {} && chmod {:o} {}",
+                qparent, qdest, mode, qdest
+            );
             req.stdin = content;
             client
                 .exec_vm_process(with_timeout(timeout_ns), &req)
@@ -592,6 +698,68 @@ where
         }
         Ok(())
     }
+
+    // Execute a fixed command in the guest without stdin.
+    // The caller is responsible for ensuring command arguments are safe (use shell_quote).
+    async fn exec_in_guest(&self, command: &str) -> Result<()> {
+        let client_guard = self.client.lock().await;
+        if let Some(client) = client_guard.as_ref() {
+            let timeout_ns = Duration::from_secs(10).as_nanos() as i64;
+            let mut req = ExecVMProcessRequest::new();
+            req.command = command.to_string();
+            req.stdin = vec![];
+            client
+                .exec_vm_process(with_timeout(timeout_ns), &req)
+                .await
+                .map_err(|e| anyhow!("exec in guest '{}': {}", command, e))?;
+        }
+        Ok(())
+    }
+}
+
+// Wrap a path in single quotes and escape any embedded single quotes.
+// This prevents shell injection regardless of the path contents.
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+// Validate that a path was generated internally and contains only safe characters.
+// Used as an additional sanity check for paths built from known-safe constants.
+fn validate_guest_path(path: &str) -> Result<()> {
+    if path
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || "/_.:-".contains(c))
+    {
+        Ok(())
+    } else {
+        Err(Error::InvalidArgument(format!(
+            "guest path contains unsafe characters: {}",
+            path
+        )))
+    }
+}
+
+// Count files and total byte size in a directory tree (non-recursive symlinks skipped).
+async fn count_dir_contents(dir: &str) -> Result<(usize, u64)> {
+    let mut count = 0usize;
+    let mut total = 0u64;
+    let mut stack = vec![dir.to_string()];
+    while let Some(d) = stack.pop() {
+        let mut entries = tokio::fs::read_dir(&d)
+            .await
+            .map_err(|e| anyhow!("read_dir {}: {}", d, e))?;
+        while let Some(entry) = entries.next_entry().await.map_err(|e| anyhow!("{}", e))? {
+            let ft = entry.file_type().await.map_err(|e| anyhow!("{}", e))?;
+            if ft.is_dir() {
+                stack.push(entry.path().to_string_lossy().to_string());
+            } else if ft.is_file() {
+                let meta = entry.metadata().await.map_err(|e| anyhow!("{}", e))?;
+                count += 1;
+                total += meta.len();
+            }
+        }
+    }
+    Ok((count, total))
 }
 
 async fn estimate_dir_size_mb(dir: &str) -> Result<u64> {
@@ -666,12 +834,18 @@ async fn copy_dir_to_ext4(src_dir: &str, img_path: &str) -> Result<()> {
         .status()
         .await;
 
-    // Always unmount regardless of rsync result
-    let _ = tokio::process::Command::new("umount")
+    // Always unmount regardless of rsync result; try force-detach if normal umount fails
+    let umount_ok = tokio::process::Command::new("umount")
         .arg(&mnt_dir)
         .status()
-        .await;
-    let _ = tokio::fs::remove_dir(&mnt_dir).await;
+        .await
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !umount_ok {
+        warn!("umount {} failed, trying force detach", mnt_dir);
+        let _ = unmount(&mnt_dir, MNT_DETACH | MNT_NOFOLLOW);
+    }
+    let _ = tokio::fs::remove_dir_all(&mnt_dir).await;
 
     match rsync_status {
         Ok(s) if s.success() => Ok(()),
@@ -690,6 +864,10 @@ mod tests {
     use vmm_common::storage::Storage;
 
     use crate::{device::DeviceInfo, sandbox::KuasarSandbox, vm::VM};
+
+    use temp_dir::TempDir;
+
+    use super::{count_dir_contents, shell_quote, validate_guest_path};
 
     #[derive(Serialize, Deserialize)]
     struct MockVM;
@@ -816,6 +994,58 @@ mod tests {
         assert_eq!(sandbox.storages.len(), 1);
         assert_eq!(sandbox.storages[0].id, "storage2");
         assert!(sandbox.storages[0].ref_container.contains_key("container2"));
+    }
+
+    #[test]
+    fn test_validate_guest_path_ok() {
+        assert!(validate_guest_path("/run/kuasar/state/storage1").is_ok());
+        assert!(validate_guest_path("/run/kuasar/storage/containers/storage42").is_ok());
+        assert!(validate_guest_path("/etc/resolv.conf").is_ok());
+        assert!(validate_guest_path("/tmp/file-name.txt").is_ok());
+    }
+
+    #[test]
+    fn test_validate_guest_path_reject_shell_special() {
+        assert!(validate_guest_path("/tmp/a;b").is_err());
+        assert!(validate_guest_path("/tmp/a b").is_err());
+        assert!(validate_guest_path("/tmp/$HOME").is_err());
+        assert!(validate_guest_path("/tmp/`cmd`").is_err());
+        assert!(validate_guest_path("/tmp/a&b").is_err());
+        assert!(validate_guest_path("/tmp/a|b").is_err());
+    }
+
+    #[test]
+    fn test_shell_quote() {
+        assert_eq!(shell_quote("/run/kuasar/state/storage1"), "'/run/kuasar/state/storage1'");
+        assert_eq!(shell_quote("/tmp/file name.txt"), "'/tmp/file name.txt'");
+        assert_eq!(shell_quote("/tmp/a'b"), "'/tmp/a'\\''b'");
+        assert_eq!(shell_quote("/tmp/$HOME"), "'/tmp/$HOME'");
+    }
+
+    #[tokio::test]
+    async fn test_count_dir_contents_empty() {
+        let dir = TempDir::new().unwrap();
+        let (count, bytes) = count_dir_contents(dir.path().to_str().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+        assert_eq!(bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn test_count_dir_contents_with_files() {
+        let dir = TempDir::new().unwrap();
+        tokio::fs::write(dir.path().join("a.txt"), b"hello").await.unwrap();
+        tokio::fs::write(dir.path().join("b.txt"), b"world!").await.unwrap();
+        let sub = dir.path().join("sub");
+        tokio::fs::create_dir(&sub).await.unwrap();
+        tokio::fs::write(sub.join("c.txt"), b"123").await.unwrap();
+
+        let (count, bytes) = count_dir_contents(dir.path().to_str().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(count, 3);
+        assert_eq!(bytes, 5 + 6 + 3);
     }
 
     #[tokio::test]

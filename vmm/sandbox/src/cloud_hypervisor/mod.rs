@@ -167,6 +167,10 @@ impl VM for CloudHypervisorVM {
     #[instrument(skip_all)]
     async fn start(&mut self) -> Result<u32> {
         create_dir_all(&self.base_dir).await?;
+        // Validate host tool availability before committing to virtio-blk mode
+        if self.sharefs_type == crate::vm::SHAREFS_VIRTIO_BLK {
+            check_virtio_blk_host_tools().await?;
+        }
         // Only start virtiofsd when sharefs_type is virtiofs
         if self.sharefs_type == "virtiofs" {
             let virtiofsd_pid = self.start_virtiofsd().await?;
@@ -368,6 +372,26 @@ impl crate::vm::Recoverable for CloudHypervisorVM {
         self.wait_chan = Some(rx);
         Ok(())
     }
+}
+
+// Verify that host tools required for virtio-blk container layer preparation are available.
+// Called before VM start when sharefs_type == "virtio-blk".
+async fn check_virtio_blk_host_tools() -> containerd_sandbox::error::Result<()> {
+    for tool in &["mkfs.ext4", "rsync"] {
+        let ok = tokio::process::Command::new("which")
+            .arg(tool)
+            .status()
+            .await
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !ok {
+            return Err(containerd_sandbox::error::Error::Other(anyhow::anyhow!(
+                "virtio-blk mode requires '{}' on the host but it was not found",
+                tool
+            )));
+        }
+    }
+    Ok(())
 }
 
 macro_rules! read_stdio {

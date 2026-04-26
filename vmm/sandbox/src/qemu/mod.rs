@@ -92,6 +92,8 @@ pub struct QemuVM {
     #[serde(skip)]
     block_driver: BlockDriver,
     #[serde(skip)]
+    sharefs_type: String,
+    #[serde(skip)]
     wait_chan: Option<Receiver<(u32, i128)>>,
     #[serde(skip)]
     client: Option<QmpClient>,
@@ -323,6 +325,10 @@ impl VM for QemuVM {
         // TODO: support get all vmm related pids
         Pids::default()
     }
+
+    fn sharefs_type(&self) -> &str {
+        &self.sharefs_type
+    }
 }
 
 impl QemuVM {
@@ -338,6 +344,7 @@ impl QemuVM {
             netns: netns.to_string(),
             pids: Pids::default(),
             block_driver: BlockDriver::default(),
+            sharefs_type: "virtiofs".to_string(),
             wait_chan: None,
             client: None,
             virtiofsd_config: None,

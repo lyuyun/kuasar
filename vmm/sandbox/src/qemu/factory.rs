@@ -68,6 +68,7 @@ impl VMFactory for QemuVMFactory {
         vm.config.name = format!("sandbox-{}", id);
         vm.config.pid_file = format!("{}/sandbox-{}.pid", s.base_dir, id);
         vm.block_driver = self.default_config.block_device_driver.clone();
+        vm.sharefs_type = self.default_config.share_fs.as_str().to_string();
 
         // set qmp socket
         vm.config.qmp_socket = Some(QmpSocket {
@@ -187,6 +188,12 @@ impl VMFactory for QemuVMFactory {
                     );
                     vm.attach_device(virtio_fs);
                 }
+            }
+            ShareFsType::VirtioBlk => {
+                return Err(Error::Unimplemented(
+                    "virtio-blk sharefs is not supported for QEMU; use virtio-9p or virtiofs"
+                        .to_string(),
+                ));
             }
         }
         if !self.default_config.common.image_path.is_empty() {

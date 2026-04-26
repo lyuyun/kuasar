@@ -309,6 +309,10 @@ impl VM for StratoVirtVM {
     fn pids(&self) -> Pids {
         self.pids.clone()
     }
+
+    fn sharefs_type(&self) -> &str {
+        "virtiofs"
+    }
 }
 
 impl StratoVirtVM {

@@ -1,0 +1,12 @@
+metadata:
+  name: vmm-blk-sandbox
+  namespace: default
+  uid: vmm-blk-sandbox-uid-001
+  attempt: 0
+linux:
+  cgroup_parent: "/kuasar/vmm"
+  security_context:
+    namespace_options:
+      network: 2
+annotations:
+  io.kubernetes.cri.runtime-handler: "vmm"

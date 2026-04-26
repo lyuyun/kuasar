@@ -250,7 +250,12 @@ mod tests {
         assert_eq!(params[6], "--kernel");
         assert_eq!(params[7], "/path/to/kernel");
         assert_eq!(params[8], "--cmdline");
-        assert_eq!(params[9], "task.sharefs_type=virtiofs"); // cmdline field set directly, not via DEFAULT_KERNEL_PARAMS
+        // This test uses vm_config.common.kernel_params = "task.sharefs_type=virtiofs",
+        // which is passed verbatim AFTER the DEFAULT_KERNEL_PARAMS + dynamically injected
+        // sharefs_type.  params[9] is the --cmdline argument value.  The default sharefs_type
+        // for CloudHypervisorVMConfig is "virtio-blk", but here the caller overrides it via
+        // kernel_params, so the final cmdline contains the caller-supplied value at the end.
+        assert_eq!(params[9], "task.sharefs_type=virtiofs");
     }
 
     #[test]
@@ -291,6 +296,41 @@ thread_pool_size = 4
         assert!(config.hypervisor.hugepages);
         assert_eq!(config.hypervisor.virtiofsd.thread_pool_size, 4);
         assert_eq!(config.hypervisor.virtiofsd.path, "/usr/local/bin/virtiofsd");
+    }
+
+    #[test]
+    fn test_default_sharefs_type_virtio_blk() {
+        let toml_str = "
+[sandbox]
+enable_tracing = false
+[hypervisor]
+path = \"/usr/local/bin/cloud-hypervisor\"
+vcpus = 1
+memory_in_mb = 1024
+kernel_path = \"/var/lib/kuasar/vmlinux.bin\"
+image_path = \"\"
+initrd_path = \"\"
+kernel_params = \"\"
+hugepages = false
+entropy_source = \"/dev/urandom\"
+[hypervisor.task]
+debug = false
+enable_tracing = false
+[hypervisor.virtiofsd]
+path = \"\"
+log_level = \"info\"
+cache = \"never\"
+thread_pool_size = 4
+";
+        let config: Config<CloudHypervisorVMConfig> = toml::from_str(toml_str).unwrap();
+        // When sharefs_type is not set in the toml, it defaults to "virtio-blk"
+        assert_eq!(config.hypervisor.sharefs_type(), "virtio-blk");
+        let chc = CloudHypervisorConfig::from(&config.hypervisor);
+        assert!(
+            chc.cmdline.contains("task.sharefs_type=virtio-blk"),
+            "expected virtio-blk in cmdline, got: {}",
+            chc.cmdline
+        );
     }
 
     #[test]

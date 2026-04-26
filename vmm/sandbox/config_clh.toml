@@ -4,20 +4,35 @@ enable_tracing = false
 
 [hypervisor]
 path = "/usr/local/bin/cloud-hypervisor"
-vcpus = 1
-memory_in_mb = 1024
 kernel_path = "/var/lib/kuasar/vmlinux.bin"
 image_path = "/var/lib/kuasar/kuasar.img"
 initrd_path = ""
-kernel_params = ""
+# Extra kernel params appended after the built-in defaults.
+# The built-in defaults already inject task.sharefs_type from the [hypervisor] sharefs_type field.
+kernel_params = "task.log_level=info task.enable_tracing=false"
+vcpus = 1
+memory_in_mb = 1024
 hugepages = false
 entropy_source = "/dev/urandom"
 debug = false
+
+# sharefs_type controls how container layers are shared with the guest VM.
+#
+#   "virtio-blk"  (default) — each container layer is packaged into an ext4 image and
+#                             hot-attached as a virtio-blk PCI device. No virtiofsd process
+#                             is started. Required for VM snapshot/restore (Phase 1).
+#                             Host dependencies: mkfs.ext4, rsync.
+#
+#   "virtiofs"    (legacy)  — container layers are shared via virtiofsd + virtio-fs.
+#                             virtiofsd must be installed at [hypervisor.virtiofsd].path.
+#
+sharefs_type = "virtio-blk"
 
 [hypervisor.task]
 debug = false
 enable_tracing = false
 
+# virtiofsd configuration — only used when sharefs_type = "virtiofs"
 [hypervisor.virtiofsd]
 path = "/usr/local/bin/virtiofsd"
 log_level = "info"

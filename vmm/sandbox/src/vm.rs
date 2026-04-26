@@ -31,6 +31,7 @@ use crate::{
 
 const VIRTIO_FS: &str = "virtio-fs";
 const VIRTIO_9P: &str = "virtio-9p";
+pub const SHAREFS_VIRTIO_BLK: &str = "virtio-blk";
 
 #[async_trait]
 pub trait VMFactory {
@@ -191,6 +192,17 @@ impl BlockDriver {
 pub enum ShareFsType {
     Virtio9P,
     VirtioFS,
+    VirtioBlk,
+}
+
+impl ShareFsType {
+    pub fn as_str(&self) -> &str {
+        match self {
+            ShareFsType::VirtioFS => "virtiofs",
+            ShareFsType::Virtio9P => "9p",
+            ShareFsType::VirtioBlk => SHAREFS_VIRTIO_BLK,
+        }
+    }
 }
 
 impl FromStr for ShareFsType {
@@ -200,6 +212,7 @@ impl FromStr for ShareFsType {
         match s {
             VIRTIO_FS => Ok(ShareFsType::VirtioFS),
             VIRTIO_9P => Ok(ShareFsType::Virtio9P),
+            SHAREFS_VIRTIO_BLK => Ok(ShareFsType::VirtioBlk),
             _ => Err(Error::InvalidArgument(s.to_string())),
         }
     }

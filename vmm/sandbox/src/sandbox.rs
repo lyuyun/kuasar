@@ -778,6 +778,7 @@ where
 
     // Push sandbox config files (hostname, resolv.conf, hosts) directly into the guest
     // via exec_vm_process TTRPC calls. Used in virtio-blk mode where there is no virtiofs.
+    // The three file pushes are issued concurrently after ensuring KUASAR_STATE_DIR exists.
     #[instrument(skip_all)]
     async fn push_sandbox_files(&self) -> Result<()> {
         let shared_path = self.get_sandbox_shared_path();
@@ -797,49 +798,64 @@ where
             .await
             .map_err(|e| anyhow!("create kuasar state dir in guest: {}", e))?;
 
-        // Push hostname to KUASAR_STATE_DIR so setup_sandbox() can read it
-        let hostname_host = format!("{}/{}", shared_path, HOSTNAME_FILENAME);
-        if let Ok(content) = tokio::fs::read(&hostname_host).await {
-            let mut req = ExecVMProcessRequest::new();
-            req.command = format!("tee {}/{}", KUASAR_STATE_DIR, HOSTNAME_FILENAME);
-            req.stdin = content;
-            client
-                .exec_vm_process(with_timeout(timeout_ns), &req)
-                .await
-                .map_err(|e| anyhow!("push hostname to guest: {}", e))?;
-        }
+        // Read all config files from host shared dir
+        let hostname_content = tokio::fs::read(format!("{}/{}", shared_path, HOSTNAME_FILENAME))
+            .await
+            .ok();
+        let resolv_content = tokio::fs::read(format!("{}/{}", shared_path, RESOLV_FILENAME))
+            .await
+            .ok();
+        let hosts_content = tokio::fs::read(format!("{}/{}", shared_path, HOSTS_FILENAME))
+            .await
+            .ok();
 
-        // Push resolv.conf both to KUASAR_STATE_DIR and /etc/resolv.conf
-        let resolv_host = format!("{}/{}", shared_path, RESOLV_FILENAME);
-        if let Ok(content) = tokio::fs::read(&resolv_host).await {
-            let mut req = ExecVMProcessRequest::new();
-            req.command = format!("tee {}/{}", KUASAR_STATE_DIR, RESOLV_FILENAME);
-            req.stdin = content.clone();
-            client
-                .exec_vm_process(with_timeout(timeout_ns), &req)
-                .await
-                .map_err(|e| anyhow!("push resolv.conf to state dir: {}", e))?;
+        // Issue all pushes concurrently to reduce sandbox start latency
+        let push_hostname = async {
+            if let Some(content) = hostname_content {
+                let mut req = ExecVMProcessRequest::new();
+                req.command = format!("tee {}/{}", KUASAR_STATE_DIR, HOSTNAME_FILENAME);
+                req.stdin = content;
+                client
+                    .exec_vm_process(with_timeout(timeout_ns), &req)
+                    .await
+                    .map_err(|e| anyhow!("push hostname to guest: {}", e))?;
+            }
+            Ok::<(), anyhow::Error>(())
+        };
 
-            let mut req2 = ExecVMProcessRequest::new();
-            req2.command = "tee /etc/resolv.conf".to_string();
-            req2.stdin = content;
-            client
-                .exec_vm_process(with_timeout(timeout_ns), &req2)
-                .await
-                .map_err(|e| anyhow!("push resolv.conf to /etc: {}", e))?;
-        }
+        let push_resolv = async {
+            if let Some(content) = resolv_content {
+                let mut req = ExecVMProcessRequest::new();
+                req.command = format!(
+                    "tee {}/{} && tee /etc/resolv.conf",
+                    KUASAR_STATE_DIR, RESOLV_FILENAME
+                );
+                req.stdin = content;
+                client
+                    .exec_vm_process(with_timeout(timeout_ns), &req)
+                    .await
+                    .map_err(|e| anyhow!("push resolv.conf to guest: {}", e))?;
+            }
+            Ok::<(), anyhow::Error>(())
+        };
 
-        // Push hosts to KUASAR_STATE_DIR for containers that bind-mount from there
-        let hosts_host = format!("{}/{}", shared_path, HOSTS_FILENAME);
-        if let Ok(content) = tokio::fs::read(&hosts_host).await {
-            let mut req = ExecVMProcessRequest::new();
-            req.command = format!("tee {}/{}", KUASAR_STATE_DIR, HOSTS_FILENAME);
-            req.stdin = content;
-            client
-                .exec_vm_process(with_timeout(timeout_ns), &req)
-                .await
-                .map_err(|e| anyhow!("push hosts to guest: {}", e))?;
-        }
+        let push_hosts = async {
+            if let Some(content) = hosts_content {
+                let mut req = ExecVMProcessRequest::new();
+                req.command = format!("tee {}/{}", KUASAR_STATE_DIR, HOSTS_FILENAME);
+                req.stdin = content;
+                client
+                    .exec_vm_process(with_timeout(timeout_ns), &req)
+                    .await
+                    .map_err(|e| anyhow!("push hosts to guest: {}", e))?;
+            }
+            Ok::<(), anyhow::Error>(())
+        };
+
+        let (r1, r2, r3) = tokio::join!(push_hostname, push_resolv, push_hosts);
+        r1.map_err(|e| containerd_sandbox::error::Error::Other(e))?;
+        r2.map_err(|e| containerd_sandbox::error::Error::Other(e))?;
+        r3.map_err(|e| containerd_sandbox::error::Error::Other(e))?;
 
         Ok(())
     }
