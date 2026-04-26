@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{collections::HashMap, str::FromStr};
+use std::{collections::HashMap, path::{Path, PathBuf}, str::FromStr};
 
 use async_trait::async_trait;
 use containerd_sandbox::{
@@ -100,6 +100,32 @@ macro_rules! impl_recoverable {
 #[async_trait]
 pub trait Recoverable {
     async fn recover(&mut self) -> Result<()>;
+}
+
+/// Sandbox-specific paths that must be updated when restoring a snapshot to a new sandbox.
+/// Only per-sandbox sockets are patched; pmem/rootfs is shared read-only across sandboxes.
+pub struct SnapshotPathOverrides {
+    pub task_vsock: String,
+    pub console_path: String,
+}
+
+pub struct RestoreSource {
+    pub snapshot_dir: PathBuf,
+    pub work_dir: PathBuf,
+    pub overrides: SnapshotPathOverrides,
+}
+
+#[derive(Debug, Default)]
+pub struct SnapshotMeta {
+    pub snapshot_dir: PathBuf,
+    pub original_task_vsock: String,
+    pub original_console_path: String,
+}
+
+#[async_trait]
+pub trait Snapshottable {
+    async fn snapshot(&mut self, dest_dir: &Path) -> Result<SnapshotMeta>;
+    async fn restore(&mut self, src: &RestoreSource) -> Result<()>;
 }
 
 #[derive(Deserialize, Debug, Clone)]

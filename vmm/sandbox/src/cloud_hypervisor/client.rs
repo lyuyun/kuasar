@@ -26,6 +26,8 @@ use containerd_sandbox::error::Result;
 use log::{debug, error, trace};
 use tokio::task::spawn_blocking;
 
+use serde_json::json;
+
 use crate::{
     cloud_hypervisor::devices::{block::DiskConfig, AddDeviceResponse, RemoveDeviceRequest},
     device::DeviceInfo,
@@ -110,6 +112,28 @@ impl ChClient {
                 unimplemented!()
             }
         }
+    }
+
+    pub fn vm_pause(&mut self) -> Result<()> {
+        simple_api_command(&mut self.socket, "PUT", "pause", None)
+            .map_err(|e| anyhow!("vm.pause: {}", e).into())
+    }
+
+    pub fn vm_resume(&mut self) -> Result<()> {
+        simple_api_command(&mut self.socket, "PUT", "resume", None)
+            .map_err(|e| anyhow!("vm.resume: {}", e).into())
+    }
+
+    pub fn vm_snapshot(&mut self, dest_url: &str) -> Result<()> {
+        let body = json!({ "destination_url": dest_url }).to_string();
+        simple_api_command(&mut self.socket, "PUT", "snapshot", Some(&body))
+            .map_err(|e| anyhow!("vm.snapshot: {}", e).into())
+    }
+
+    pub fn vm_restore(&mut self, source_url: &str, prefault: bool) -> Result<()> {
+        let body = json!({ "source_url": source_url, "prefault": prefault }).to_string();
+        simple_api_command(&mut self.socket, "PUT", "restore", Some(&body))
+            .map_err(|e| anyhow!("vm.restore: {}", e).into())
     }
 
     pub fn hot_detach(&mut self, device_id: &str) -> Result<()> {

@@ -32,18 +32,23 @@ use tokio::{
 use tracing::instrument;
 use vmm_common::SHARED_DIR_SUFFIX;
 
+use ttrpc::context::with_timeout;
+use vmm_common::api::sandbox::ExecVMProcessRequest;
+
 use crate::{
+    client::new_sandbox_client,
     cloud_hypervisor::{
         client::ChClient,
         config::{CloudHypervisorConfig, CloudHypervisorVMConfig, VirtiofsdConfig},
         devices::{
             block::Disk, vfio::VfioDevice, virtio_net::VirtioNetDevice, CloudHypervisorDevice,
         },
+        snapshot::patch_snapshot_config,
     },
     device::{BusType, DeviceInfo},
     param::ToCmdLineParams,
     utils::{read_std, set_cmd_fd, set_cmd_netns, wait_channel, wait_pid, write_file_atomic},
-    vm::{Pids, VcpuThreads, VM},
+    vm::{Pids, RestoreSource, SnapshotMeta, Snapshottable, VcpuThreads, VM},
 };
 
 mod client;
@@ -51,6 +56,7 @@ pub mod config;
 pub mod devices;
 pub mod factory;
 pub mod hooks;
+pub mod snapshot;
 
 const VCPU_PREFIX: &str = "vcpu";
 
@@ -370,6 +376,137 @@ impl crate::vm::Recoverable for CloudHypervisorVM {
             tx.send(wait_result).unwrap_or_default();
         });
         self.wait_chan = Some(rx);
+        Ok(())
+    }
+}
+
+impl CloudHypervisorVM {
+    fn vsock_path(&self) -> String {
+        format!("{}/task.vsock", self.base_dir)
+    }
+
+    fn console_log_path(&self) -> String {
+        format!("/tmp/{}-task.log", self.id)
+    }
+
+    async fn sync_guest_fs(&self) -> Result<()> {
+        let client = new_sandbox_client(&self.agent_socket).await?;
+        let timeout_ns = Duration::from_secs(10).as_nanos() as i64;
+        let mut req = ExecVMProcessRequest::new();
+        req.command = "sync".to_string();
+        client
+            .exec_vm_process(with_timeout(timeout_ns), &req)
+            .await
+            .map_err(|e| anyhow!("guest sync: {}", e))?;
+        Ok(())
+    }
+
+    async fn launch_for_restore(&mut self) -> Result<()> {
+        create_dir_all(&self.base_dir).await?;
+        let child = {
+            let mut cmd = tokio::process::Command::new(&self.config.path);
+            cmd.arg("--api-socket").arg(&self.config.api_socket);
+            if self.config.debug {
+                cmd.arg("-vv");
+            }
+            set_cmd_netns(&mut cmd, self.netns.to_string())?;
+            cmd.stdout(Stdio::piped());
+            cmd.stderr(Stdio::piped());
+            info!("start cloud-hypervisor for restore: {:?}", cmd);
+            cmd.spawn()
+                .map_err(|e| anyhow!("failed to spawn cloud-hypervisor for restore: {}", e))?
+        };
+        let pid = child.id();
+        self.pids.vmm_pid = pid;
+        let pid_file = format!("{}/pid", self.base_dir);
+        let (tx, rx) = channel((0u32, 0i128));
+        self.wait_chan = Some(rx);
+        spawn_wait(
+            child,
+            format!("cloud-hypervisor-restore {}", self.id),
+            Some(pid_file),
+            Some(tx),
+        );
+        match self.create_client().await {
+            Ok(client) => self.client = Some(client),
+            Err(e) => {
+                if let Err(re) = self.stop(true).await {
+                    warn!("rollback in restore launch: {}", re);
+                }
+                return Err(e);
+            }
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl Snapshottable for CloudHypervisorVM {
+    async fn snapshot(&mut self, dest_dir: &std::path::Path) -> Result<SnapshotMeta> {
+        tokio::fs::create_dir_all(dest_dir).await?;
+
+        // Flush guest ext4 journals so snapshot captures fully-committed state.
+        if let Err(e) = self.sync_guest_fs().await {
+            warn!("guest sync before snapshot failed, snapshot may be inconsistent: {}", e);
+        }
+
+        let client = self.get_client()?;
+
+        // Freeze CPU and all device queues for a consistent point-in-time capture.
+        client.vm_pause().map_err(|e| anyhow!("vm.pause: {}", e))?;
+
+        let dest_url = format!("file://{}", dest_dir.display());
+        let snap_result = client.vm_snapshot(&dest_url);
+
+        // Always resume — a stuck VM is worse than a skipped snapshot.
+        if let Err(e) = client.vm_resume() {
+            error!("vm.resume after snapshot failed: {}", e);
+        }
+
+        snap_result.map_err(|e| anyhow!("vm.snapshot: {}", e))?;
+
+        Ok(SnapshotMeta {
+            snapshot_dir: dest_dir.to_path_buf(),
+            original_task_vsock: self.vsock_path(),
+            original_console_path: self.console_log_path(),
+        })
+    }
+
+    async fn restore(&mut self, src: &RestoreSource) -> Result<()> {
+        tokio::fs::create_dir_all(&src.work_dir).await?;
+
+        // 1. Write patched config.json (sandbox-specific socket paths updated).
+        patch_snapshot_config(
+            &src.snapshot_dir.join("config.json"),
+            &src.work_dir.join("config.json"),
+            &src.overrides,
+        )
+        .await?;
+
+        // 2. Symlink the immutable snapshot artefacts into the per-sandbox work dir.
+        let mr_link = src.work_dir.join("memory-ranges");
+        if !mr_link.exists() {
+            tokio::fs::symlink(src.snapshot_dir.join("memory-ranges"), &mr_link)
+                .await
+                .map_err(|e| anyhow!("symlink memory-ranges: {}", e))?;
+        }
+        let state_link = src.work_dir.join("state.json");
+        if !state_link.exists() {
+            tokio::fs::symlink(src.snapshot_dir.join("state.json"), &state_link)
+                .await
+                .map_err(|e| anyhow!("symlink state.json: {}", e))?;
+        }
+
+        // 3. Start CH with only --api-socket; all VM config comes from the snapshot.
+        self.launch_for_restore().await?;
+
+        // 4. Trigger restore; CH loads config.json + state.json + memory-ranges from work_dir.
+        let source_url = format!("file://{}", src.work_dir.display());
+        let client = self.get_client()?;
+        client
+            .vm_restore(&source_url, false)
+            .map_err(|e| anyhow!("vm.restore: {}", e))?;
+
         Ok(())
     }
 }
