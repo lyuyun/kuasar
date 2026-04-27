@@ -31,6 +31,24 @@ pub struct TemplateMeta {
     pub original_console_path: String,
 }
 
+impl TemplateMeta {
+    /// Serialize to `{dir}/metadata.json` atomically.
+    pub async fn save(&self, dir: &Path) -> Result<()> {
+        let content = serde_json::to_string_pretty(self)
+            .map_err(|e| anyhow!("serialize TemplateMeta: {}", e))?;
+        write_file_atomic(&dir.join("metadata.json"), &content).await
+    }
+
+    /// Deserialize from `{dir}/metadata.json`.
+    pub async fn load(dir: &Path) -> Result<Self> {
+        let content = tokio::fs::read_to_string(dir.join("metadata.json"))
+            .await
+            .map_err(|e| anyhow!("read metadata.json from {}: {}", dir.display(), e))?;
+        serde_json::from_str(&content)
+            .map_err(|e| anyhow!("parse metadata.json: {}", e).into())
+    }
+}
+
 /// Patch a Cloud Hypervisor `config.json` by updating sandbox-specific socket and log paths.
 ///
 /// CH's config.json records absolute paths for the vsock and console devices, which are unique
@@ -71,6 +89,7 @@ pub async fn patch_snapshot_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
     use temp_dir::TempDir;
 
     #[tokio::test]
@@ -120,6 +139,33 @@ mod tests {
             patched["payload"]["pmem"][0]["file"],
             "/var/lib/kuasar/rootfs.img"
         );
+    }
+
+    #[tokio::test]
+    async fn test_template_meta_save_load_roundtrip() {
+        let dir = TempDir::new().unwrap();
+        let meta = TemplateMeta {
+            id: "tmpl-001".to_string(),
+            snapshot_dir: PathBuf::from("/var/lib/kuasar/templates/tmpl-001/snapshot"),
+            original_task_vsock: "/var/lib/kuasar/templates/tmpl-001/task.vsock".to_string(),
+            original_console_path: "/tmp/tmpl-001-task.log".to_string(),
+        };
+
+        meta.save(dir.path()).await.unwrap();
+
+        let loaded = TemplateMeta::load(dir.path()).await.unwrap();
+        assert_eq!(loaded.id, meta.id);
+        assert_eq!(loaded.snapshot_dir, meta.snapshot_dir);
+        assert_eq!(loaded.original_task_vsock, meta.original_task_vsock);
+        assert_eq!(loaded.original_console_path, meta.original_console_path);
+    }
+
+    #[tokio::test]
+    async fn test_template_meta_load_missing_returns_error() {
+        let dir = TempDir::new().unwrap();
+        let result = TemplateMeta::load(dir.path()).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("metadata.json"));
     }
 
     #[tokio::test]

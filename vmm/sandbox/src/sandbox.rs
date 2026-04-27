@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{collections::HashMap, io::ErrorKind, path::Path, sync::Arc, time::{Duration, Instant}};
+use std::{collections::HashMap, io::ErrorKind, path::{Path, PathBuf}, sync::Arc, time::{Duration, Instant}};
 
 use anyhow::anyhow;
 use async_trait::async_trait;
@@ -57,7 +57,7 @@ use crate::{
     container::KuasarContainer,
     network::{Network, NetworkConfig},
     utils::{get_dns_config, get_hostname, get_resources, get_sandbox_cgroup_parent_path},
-    vm::{Hooks, Recoverable, VMFactory, VM},
+    vm::{Hooks, Recoverable, RestoreSource, Snapshottable, SnapshotPathOverrides, VMFactory, VM},
 };
 
 pub const KUASAR_GUEST_SHARE_DIR: &str = "/run/kuasar/storage/containers/";
@@ -377,6 +377,82 @@ where
     }
 }
 
+impl<F, H> KuasarSandboxer<F, H>
+where
+    F: VMFactory + Sync + Send,
+    F::VM: VM + Snapshottable + Sync + Send + 'static,
+    H: Hooks<F::VM> + Sync + Send,
+{
+    /// Start an already-created sandbox by restoring it from `snapshot_dir` rather than
+    /// cold-booting the VM.  Falls back to a cold start if restore fails at any step.
+    ///
+    /// The sandbox must have been previously created with `create()`.
+    pub async fn start_from_snapshot(&self, id: &str, snapshot_dir: &Path) -> Result<()> {
+        let sandbox_mutex = self
+            .sandboxes
+            .read()
+            .await
+            .get(id)
+            .ok_or_else(|| Error::NotFound(id.to_string()))?
+            .clone();
+
+        let mut sandbox = sandbox_mutex.lock().await;
+
+        self.hooks.pre_start(&mut sandbox).await?;
+
+        if !sandbox.data.netns.is_empty() {
+            sandbox.prepare_network().await?;
+        }
+
+        let work_dir = PathBuf::from(format!("{}/restore", sandbox.base_dir));
+        let src = RestoreSource {
+            snapshot_dir: snapshot_dir.to_path_buf(),
+            work_dir,
+            overrides: SnapshotPathOverrides {
+                task_vsock: format!("{}/task.vsock", sandbox.base_dir),
+                console_path: format!("/tmp/{}-task.log", sandbox.id),
+            },
+        };
+
+        if let Err(e) = sandbox.start_from_snapshot(src).await {
+            sandbox.destroy_network().await;
+            return Err(e);
+        }
+
+        let sandbox_clone = sandbox_mutex.clone();
+        monitor(sandbox_clone);
+
+        if let Err(e) = sandbox.add_to_cgroup().await {
+            if let Err(re) = sandbox.stop(true).await {
+                warn!("sandbox {}: rollback add_to_cgroup (restore): {}", id, re);
+                return Err(e);
+            }
+            sandbox.destroy_network().await;
+            return Err(e);
+        }
+
+        if let Err(e) = self.hooks.post_start(&mut sandbox).await {
+            if let Err(re) = sandbox.stop(true).await {
+                warn!("sandbox {}: rollback post_start hook (restore): {}", id, re);
+                return Err(e);
+            }
+            sandbox.destroy_network().await;
+            return Err(e);
+        }
+
+        if let Err(e) = sandbox.dump().await {
+            if let Err(re) = sandbox.stop(true).await {
+                warn!("sandbox {}: rollback dump (restore): {}", id, re);
+                return Err(e);
+            }
+            sandbox.destroy_network().await;
+            return Err(e);
+        }
+
+        Ok(())
+    }
+}
+
 #[async_trait]
 impl<V> Sandbox for KuasarSandbox<V>
 where
@@ -451,6 +527,69 @@ where
     #[instrument(skip_all)]
     fn get_data(&self) -> Result<SandboxData> {
         Ok(self.data.clone())
+    }
+}
+
+impl<V> KuasarSandbox<V>
+where
+    V: VM + Snapshottable + Sync + Send,
+{
+    /// Restore this sandbox from a snapshot instead of cold-booting the VM.
+    ///
+    /// On restore failure the work_dir is cleaned up and execution falls back
+    /// to a regular cold start, so the caller always gets a running sandbox.
+    pub(crate) async fn start_from_snapshot(&mut self, src: RestoreSource) -> Result<()> {
+        let work_dir = src.work_dir.clone();
+        match self.try_restore(&src).await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                warn!(
+                    "sandbox {}: restore failed ({}), cleaning up and falling back to cold start",
+                    self.id, e
+                );
+                if let Err(ce) = tokio::fs::remove_dir_all(&work_dir).await {
+                    warn!("sandbox {}: cleanup restore work_dir: {}", self.id, ce);
+                }
+                self.start().await
+            }
+        }
+    }
+
+    async fn try_restore(&mut self, src: &RestoreSource) -> Result<()> {
+        // vm.restore() launches CH, calls vm.restore API, and waits for agent ready.
+        self.vm.restore(src).await?;
+
+        let pid = self.vm.pids().vmm_pid.unwrap_or_default();
+
+        if let Err(e) = self.init_client().await {
+            if let Err(re) = self.vm.stop(true).await {
+                warn!("sandbox {}: rollback init_client (restore): {}", self.id, re);
+            }
+            return Err(e);
+        }
+
+        if self.vm.sharefs_type() == "virtio-blk" {
+            if let Err(e) = self.push_sandbox_files().await {
+                if let Err(re) = self.vm.stop(true).await {
+                    warn!(
+                        "sandbox {}: rollback push_sandbox_files (restore): {}",
+                        self.id, re
+                    );
+                }
+                return Err(e);
+            }
+        }
+
+        if let Err(e) = self.setup_sandbox().await {
+            if let Err(re) = self.vm.stop(true).await {
+                warn!("sandbox {}: rollback setup_sandbox (restore): {}", self.id, re);
+            }
+            return Err(e);
+        }
+
+        self.forward_events().await;
+        self.status = SandboxStatus::Running(pid);
+        Ok(())
     }
 }
 
