@@ -39,6 +39,21 @@ pub trait VMFactory {
     type Config: Sync + Send;
     fn new(config: Self::Config) -> Self;
     async fn create_vm(&self, id: &str, s: &SandboxOption) -> Result<Self::VM>;
+
+    // Optional accessors used by the template pool to build TemplateKey and PooledTemplate.
+    // Implementations that support templating should override these.
+    fn image_path(&self) -> &str {
+        ""
+    }
+    fn kernel_path(&self) -> &str {
+        ""
+    }
+    fn vcpus(&self) -> u32 {
+        1
+    }
+    fn memory_mb(&self) -> u32 {
+        1024
+    }
 }
 
 #[async_trait]

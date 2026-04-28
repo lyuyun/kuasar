@@ -14,7 +14,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{collections::HashMap, io::ErrorKind, path::{Path, PathBuf}, sync::Arc, time::{Duration, Instant}};
+use std::{
+    collections::HashMap,
+    io::ErrorKind,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
 
 use anyhow::anyhow;
 use async_trait::async_trait;
@@ -56,8 +62,12 @@ use crate::{
     },
     container::KuasarContainer,
     network::{Network, NetworkConfig},
+    template::{CreateTemplateRequest, PooledTemplate, TemplateKey, TemplateMetrics, TemplatePool},
     utils::{get_dns_config, get_hostname, get_resources, get_sandbox_cgroup_parent_path},
-    vm::{Hooks, Recoverable, RestoreSource, Snapshottable, SnapshotPathOverrides, VMFactory, VM},
+    vm::{
+        Hooks, Recoverable, RestoreSource, SnapshotMeta, Snapshottable, SnapshotPathOverrides,
+        VMFactory, VM,
+    },
 };
 
 pub const KUASAR_GUEST_SHARE_DIR: &str = "/run/kuasar/storage/containers/";
@@ -69,6 +79,7 @@ pub struct KuasarSandboxer<F: VMFactory, H: Hooks<F::VM>> {
     config: SandboxConfig,
     #[allow(clippy::type_complexity)]
     sandboxes: Arc<RwLock<HashMap<String, Arc<Mutex<KuasarSandbox<F::VM>>>>>>,
+    pub template_pool: Option<Arc<TemplatePool>>,
 }
 
 impl<F, H> KuasarSandboxer<F, H>
@@ -83,7 +94,32 @@ where
             hooks,
             config,
             sandboxes: Arc::new(Default::default()),
+            template_pool: None,
         }
+    }
+
+    /// Initialize the template pool backed by `store_dir`.
+    ///
+    /// If `store_dir` already contains persisted templates from a previous run,
+    /// they are reloaded.  Call this once at startup before serving requests.
+    pub async fn init_template_pool(
+        &mut self,
+        store_dir: PathBuf,
+        max_per_key: usize,
+    ) -> Result<()> {
+        let pool = TemplatePool::load_from_disk(store_dir, max_per_key).await?;
+        info!(
+            "template pool initialized: {} templates across {} keys",
+            pool.total_depth().await,
+            0 // key count not exposed yet
+        );
+        self.template_pool = Some(pool);
+        Ok(())
+    }
+
+    /// Return pool metrics, if the pool has been initialized.
+    pub fn pool_metrics(&self) -> Option<Arc<TemplateMetrics>> {
+        self.template_pool.as_ref().map(|p| p.metrics.clone())
     }
 }
 
@@ -1217,6 +1253,269 @@ fn monitor<V: VM + 'static>(sandbox_mutex: Arc<Mutex<KuasarSandbox<V>>>) {
                 .unwrap_or_default();
         }
     });
+}
+
+// ---------------------------------------------------------------------------
+// Template pool: create_template + start_with_template
+// ---------------------------------------------------------------------------
+
+/// Core template creation logic shared between `KuasarSandboxer::create_template`
+/// and the background refill task.  Isolated as a free function so it can be
+/// spawned without borrowing `self`.
+async fn create_template_worker<F>(
+    factory: F,
+    pool: Arc<TemplatePool>,
+    req: CreateTemplateRequest,
+) -> Result<PooledTemplate>
+where
+    F: VMFactory,
+    F::VM: VM + Snapshottable + Sync + Send,
+{
+    let template_base = pool.store_dir.join(&req.id);
+    let vm_base = template_base.join("vm");
+    tokio::fs::create_dir_all(&vm_base)
+        .await
+        .map_err(|e| anyhow!("create template vm dir: {}", e))?;
+
+    let sandbox_opt = SandboxOption {
+        base_dir: vm_base.to_string_lossy().to_string(),
+        sandbox: SandboxData {
+            id: req.id.clone(),
+            ..Default::default()
+        },
+    };
+
+    let mut vm = factory.create_vm(&req.id, &sandbox_opt).await?;
+    vm.start().await?;
+
+    // Execute optional warmup commands to pre-warm page cache before snapshotting.
+    let warmup_start = Instant::now();
+    if !req.warmup_commands.is_empty() {
+        let addr = vm.socket_address();
+        let client = new_sandbox_client_fail_fast(&addr)
+            .await
+            .map_err(|e| anyhow!("template {}: connect to agent for warmup: {}", req.id, e))?;
+        let timeout_ns = Duration::from_secs(30).as_nanos() as i64;
+        for cmd in &req.warmup_commands {
+            let mut exec_req = ExecVMProcessRequest::new();
+            exec_req.command = cmd.clone();
+            exec_req.stdin = vec![];
+            client
+                .exec_vm_process(with_timeout(timeout_ns), &exec_req)
+                .await
+                .map_err(|e| anyhow!("template {}: warmup '{}': {}", req.id, cmd, e))?;
+        }
+    }
+    let warmup_ms = warmup_start.elapsed().as_millis() as u64;
+
+    let snapshot_dir = template_base.join("snapshot");
+    tokio::fs::create_dir_all(&snapshot_dir)
+        .await
+        .map_err(|e| anyhow!("create snapshot dir: {}", e))?;
+
+    let snap_start = Instant::now();
+    let meta: SnapshotMeta = vm.snapshot(&snapshot_dir).await.map_err(|e| {
+        anyhow!("template {}: snapshot failed: {}", req.id, e)
+    })?;
+    info!(
+        "template {}: snapshot captured in {:.3}s",
+        req.id,
+        snap_start.elapsed().as_secs_f64()
+    );
+
+    if let Err(e) = vm.stop(false).await {
+        warn!("template {}: stop after snapshot: {}", req.id, e);
+    }
+
+    let key = TemplateKey::new(factory.image_path(), factory.vcpus(), factory.memory_mb());
+    let tmpl = PooledTemplate::new(
+        &req.id,
+        key,
+        meta.snapshot_dir,
+        factory.image_path(),
+        factory.kernel_path(),
+        factory.vcpus(),
+        factory.memory_mb(),
+        warmup_ms,
+        meta.original_task_vsock,
+        meta.original_console_path,
+    );
+
+    pool.add(tmpl.clone()).await?;
+    info!(
+        "template {}: added to pool (warmup={}ms, pool_depth={})",
+        req.id,
+        warmup_ms,
+        pool.depth(&tmpl.key).await
+    );
+    Ok(tmpl)
+}
+
+impl<F, H> KuasarSandboxer<F, H>
+where
+    F: VMFactory + Clone + Sync + Send + 'static,
+    F::VM: VM + Snapshottable + Sync + Send + 'static,
+    H: Hooks<F::VM> + Sync + Send,
+{
+    /// Create a pre-warmed VM snapshot and add it to the template pool.
+    ///
+    /// Spins up a temporary VM, optionally runs warmup commands, snapshots it,
+    /// stops it, and stores the resulting template.  The temporary VM files are
+    /// kept under `{pool.store_dir}/{req.id}/vm/`; only the snapshot dir is
+    /// retained after the VM stops.
+    pub async fn create_template(&self, req: CreateTemplateRequest) -> Result<PooledTemplate> {
+        let pool = self
+            .template_pool
+            .as_ref()
+            .ok_or_else(|| anyhow!("template pool not initialized"))?
+            .clone();
+
+        info!("creating template {}", req.id);
+        create_template_worker(self.factory.clone(), pool, req).await
+    }
+
+    /// Try to start an already-created sandbox from the template pool.
+    ///
+    /// If a matching template exists in the pool it is consumed and the sandbox
+    /// is restored from that snapshot (fast path, typically < 500 ms).
+    /// On any restore failure the template is released back and the call falls
+    /// back to a regular cold start so the caller always gets a running sandbox.
+    ///
+    /// If the pool is empty or not initialized, a cold start is performed.
+    ///
+    /// After a successful template-hit restore a background task is spawned to
+    /// refill the pool with a fresh template.
+    pub async fn start_with_template(&self, id: &str, key: &TemplateKey) -> Result<()> {
+        let pool = match &self.template_pool {
+            Some(p) => p.clone(),
+            None => return self.start_cold(id).await,
+        };
+
+        let tmpl = pool.acquire(key).await;
+        match tmpl {
+            None => {
+                pool.metrics.record_miss();
+                info!("template pool miss for sandbox {}, cold-starting", id);
+                self.start_cold(id).await
+            }
+            Some(tmpl) => {
+                let restore_start = Instant::now();
+                info!(
+                    "template pool hit for sandbox {} (template {}), restoring",
+                    id, tmpl.id
+                );
+                match self.start_from_snapshot(id, &tmpl.snapshot_dir).await {
+                    Ok(()) => {
+                        let ms = restore_start.elapsed().as_millis() as u64;
+                        pool.metrics.record_hit(ms);
+                        info!(
+                            "sandbox {} restored from template {} in {}ms (pool hit_rate={:.1}%)",
+                            id,
+                            tmpl.id,
+                            ms,
+                            pool.metrics.hit_rate() * 100.0
+                        );
+                        // Background refill: replace the consumed template asynchronously
+                        let factory = self.factory.clone();
+                        let pool2 = pool.clone();
+                        let refill_id = format!("tmpl-refill-{}", next_template_id());
+                        tokio::spawn(async move {
+                            if let Err(e) = create_template_worker(
+                                factory,
+                                pool2,
+                                CreateTemplateRequest::new(refill_id),
+                            )
+                            .await
+                            {
+                                warn!("template pool background refill failed: {}", e);
+                            }
+                        });
+                        Ok(())
+                    }
+                    Err(e) => {
+                        warn!(
+                            "sandbox {}: template restore failed ({}), releasing template and cold-starting",
+                            id, e
+                        );
+                        pool.release(tmpl).await;
+                        pool.metrics.record_miss();
+                        self.start_cold(id).await
+                    }
+                }
+            }
+        }
+    }
+
+    /// Internal helper: run the standard `Sandboxer::start` flow without
+    /// template logic.  Needed because `start_with_template` can't call
+    /// `Sandboxer::start` directly (trait method dispatch requires `Self: Sized`
+    /// and additional async machinery; the impl below avoids that complexity).
+    async fn start_cold(&self, id: &str) -> Result<()> {
+        let sandbox_mutex = self
+            .sandboxes
+            .read()
+            .await
+            .get(id)
+            .ok_or_else(|| containerd_sandbox::error::Error::NotFound(id.to_string()))?
+            .clone();
+
+        let mut sandbox = sandbox_mutex.lock().await;
+        self.hooks.pre_start(&mut sandbox).await?;
+
+        if !sandbox.data.netns.is_empty() {
+            sandbox.prepare_network().await?;
+        }
+
+        if let Err(e) = sandbox.start().await {
+            sandbox.destroy_network().await;
+            return Err(e);
+        }
+
+        let sandbox_clone = sandbox_mutex.clone();
+        monitor(sandbox_clone);
+
+        if let Err(e) = sandbox.add_to_cgroup().await {
+            if let Err(re) = sandbox.stop(true).await {
+                warn!("sandbox {}: rollback add_to_cgroup (cold): {}", id, re);
+                return Err(e);
+            }
+            sandbox.destroy_network().await;
+            return Err(e);
+        }
+
+        if let Err(e) = self.hooks.post_start(&mut sandbox).await {
+            if let Err(re) = sandbox.stop(true).await {
+                warn!("sandbox {}: rollback post_start hook (cold): {}", id, re);
+                return Err(e);
+            }
+            sandbox.destroy_network().await;
+            return Err(e);
+        }
+
+        if let Err(e) = sandbox.dump().await {
+            if let Err(re) = sandbox.stop(true).await {
+                warn!("sandbox {}: rollback dump (cold): {}", id, re);
+                return Err(e);
+            }
+            sandbox.destroy_network().await;
+            return Err(e);
+        }
+
+        Ok(())
+    }
+}
+
+/// Generate a short unique ID for background-refill templates.
+/// Uses a monotonic counter + timestamp to avoid pulling in the uuid crate.
+fn next_template_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{:x}-{:04x}", ts, n)
 }
 
 #[cfg(test)]

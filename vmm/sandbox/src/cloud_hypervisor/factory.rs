@@ -26,6 +26,7 @@ use crate::{
     vm::VMFactory,
 };
 
+#[derive(Clone)]
 pub struct CloudHypervisorVMFactory {
     vm_config: CloudHypervisorVMConfig,
 }
@@ -37,6 +38,22 @@ impl VMFactory for CloudHypervisorVMFactory {
 
     fn new(config: Self::Config) -> Self {
         Self { vm_config: config }
+    }
+
+    fn image_path(&self) -> &str {
+        &self.vm_config.common.image_path
+    }
+
+    fn kernel_path(&self) -> &str {
+        &self.vm_config.common.kernel_path
+    }
+
+    fn vcpus(&self) -> u32 {
+        self.vm_config.common.vcpus
+    }
+
+    fn memory_mb(&self) -> u32 {
+        self.vm_config.common.memory_in_mb
     }
 
     async fn create_vm(

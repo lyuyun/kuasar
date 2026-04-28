@@ -24,7 +24,7 @@ root=/dev/pmem0p1 \
 rootflags=data=ordered,errors=remount-ro \
 ro rootfstype=ext4";
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 pub struct CloudHypervisorVMConfig {
     pub path: String,
     #[serde(flatten)]
@@ -61,7 +61,7 @@ impl Default for CloudHypervisorVMConfig {
     }
 }
 
-#[derive(Deserialize, Default)]
+#[derive(Deserialize, Default, Clone)]
 pub struct TaskConfig {
     pub debug: bool,
     pub enable_tracing: bool,

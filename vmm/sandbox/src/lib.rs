@@ -34,5 +34,6 @@ pub mod kata_config;
 pub mod qemu;
 pub mod sandbox;
 pub mod stratovirt;
+pub mod template;
 pub mod utils;
 pub mod version;
