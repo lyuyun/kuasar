@@ -41,6 +41,7 @@ use crate::{
     vm::{BlockDriver, ShareFsType, VMFactory},
 };
 
+#[derive(Clone)]
 pub struct QemuVMFactory {
     default_config: QemuVMConfig,
 }

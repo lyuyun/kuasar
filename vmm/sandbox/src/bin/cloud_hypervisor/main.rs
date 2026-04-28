@@ -19,6 +19,7 @@ use std::path::Path;
 use clap::Parser;
 use vmm_common::{signal, trace};
 use vmm_sandboxer::{
+    admin::TemplateAdminServer,
     args,
     cloud_hypervisor::{factory::CloudHypervisorVMFactory, hooks::CloudHypervisorHooks},
     config::Config,
@@ -35,9 +36,8 @@ async fn main() {
         return;
     }
 
-    let config = Config::load_config(&args.config).await.unwrap();
+    let config: Config<_> = Config::load_config(&args.config).await.unwrap();
 
-    // Update args log level if it not presents args but in config.
     let log_level = args.log_level.unwrap_or(config.sandbox.log_level());
     let service_name = "kuasar-vmm-sandboxer-clh-service";
     trace::set_enabled(config.sandbox.enable_tracing);
@@ -47,6 +47,8 @@ async fn main() {
         log::error!("failed to send ready notify: {}", e);
     }
 
+    let template_pool_cfg = config.template_pool;
+
     let mut sandboxer: KuasarSandboxer<CloudHypervisorVMFactory, CloudHypervisorHooks> =
         KuasarSandboxer::new(
             config.sandbox,
@@ -54,16 +56,32 @@ async fn main() {
             CloudHypervisorHooks::default(),
         );
 
+    if let Some(pool_cfg) = template_pool_cfg {
+        sandboxer
+            .init_template_pool(
+                pool_cfg.store_dir,
+                pool_cfg.max_per_key.unwrap_or(10),
+            )
+            .await
+            .unwrap_or_else(|e| log::error!("failed to init template pool: {}", e));
+    }
+
+    // Spawn the admin API server if the template pool is configured.
+    if let Some(handle) = sandboxer.admin_handle() {
+        let admin_sock = args.admin.clone();
+        tokio::spawn(async move {
+            TemplateAdminServer::new(handle, admin_sock).serve().await;
+        });
+    }
+
     tokio::spawn(async move {
         signal::handle_signals(&log_level, service_name).await;
     });
 
-    // Do recovery job
     if Path::new(&args.dir).exists() {
         sandboxer.recover(&args.dir).await;
     }
 
-    // Run the sandboxer
     containerd_sandbox::run(
         "kuasar-vmm-sandboxer-clh",
         &args.listen,

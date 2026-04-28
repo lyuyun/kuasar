@@ -27,6 +27,7 @@ mod param;
 mod storage;
 mod vm;
 
+pub mod admin;
 pub mod args;
 pub mod cloud_hypervisor;
 pub mod config;

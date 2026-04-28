@@ -49,6 +49,10 @@ pub struct Args {
     /// Logging level for sandboxer [trace, debug, info, warn, error, fatal, panic]
     #[arg(long, value_name = "STRING")]
     pub log_level: Option<String>,
+
+    /// Unix socket path for the admin API (template management via kuasar-ctl)
+    #[arg(long, value_name = "FILE", default_value = "/run/kuasar-vmm-admin.sock")]
+    pub admin: String,
 }
 
 #[cfg(test)]
@@ -59,7 +63,7 @@ mod tests {
 
     #[test]
     fn test_args_parse_default() {
-        let args = Args::parse();
+        let args = Args::parse_from(["sandboxer"]);
         assert!(!args.version);
         assert_eq!(args.config, "/var/lib/kuasar/config.toml");
         assert_eq!(args.dir, "/run/kuasar-vmm");

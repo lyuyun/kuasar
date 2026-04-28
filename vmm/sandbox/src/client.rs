@@ -71,6 +71,14 @@ pub(crate) async fn new_sandbox_client_fail_fast(address: &str) -> Result<Sandbo
     Ok(SandboxServiceClient::new(client))
 }
 
+pub(crate) async fn new_task_client(
+    address: &str,
+) -> Result<containerd_shim::protos::shim_async::TaskClient> {
+    let client =
+        new_ttrpc_client_with_fast_fail(address, FAST_FAIL_CONNECT_TIMEOUT_IN_SECS).await?;
+    Ok(containerd_shim::protos::shim_async::TaskClient::new(client))
+}
+
 async fn new_ttrpc_client_with_timeout(address: &str, t: u64) -> Result<Client> {
     let mut last_err = Error::Other(anyhow!(""));
 

@@ -57,7 +57,7 @@ use crate::{
         virtiofs::VirtiofsDaemon,
     },
     utils::{read_std, wait_channel, wait_pid},
-    vm::{BlockDriver, Pids, VcpuThreads, VM},
+    vm::{BlockDriver, Pids, Snapshottable, VcpuThreads, VM},
 };
 
 pub mod config;
@@ -599,3 +599,5 @@ impl StratoVirtVM {
 }
 
 impl_recoverable!(StratoVirtVM);
+
+impl Snapshottable for StratoVirtVM {}

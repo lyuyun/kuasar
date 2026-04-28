@@ -41,6 +41,7 @@ use crate::{
     vm::{BlockDriver, VMFactory},
 };
 
+#[derive(Clone)]
 pub struct StratoVirtVMFactory {
     default_config: StratoVirtVMConfig,
 }

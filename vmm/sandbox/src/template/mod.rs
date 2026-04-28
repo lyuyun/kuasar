@@ -64,8 +64,6 @@ pub struct PooledTemplate {
     pub memory_mb: u32,
     /// Unix timestamp (seconds) when this template was created.
     pub created_at_secs: u64,
-    /// Time taken for warmup phase in milliseconds.
-    pub warmup_ms: u64,
     /// Original hvsock path recorded at snapshot time (needed to compute overrides).
     pub original_task_vsock: String,
     /// Original console log path recorded at snapshot time.
@@ -104,7 +102,6 @@ impl PooledTemplate {
         kernel_path: impl Into<String>,
         vcpus: u32,
         memory_mb: u32,
-        warmup_ms: u64,
         original_task_vsock: impl Into<String>,
         original_console_path: impl Into<String>,
     ) -> Self {
@@ -117,7 +114,6 @@ impl PooledTemplate {
             vcpus,
             memory_mb,
             created_at_secs: Self::now_secs(),
-            warmup_ms,
             original_task_vsock: original_task_vsock.into(),
             original_console_path: original_console_path.into(),
         }
@@ -299,28 +295,27 @@ impl TemplatePool {
             .map(|q| q.len())
             .sum()
     }
+
+    /// Number of distinct keys that have at least one available template.
+    pub async fn key_count(&self) -> usize {
+        self.available
+            .lock()
+            .await
+            .values()
+            .filter(|q| !q.is_empty())
+            .count()
+    }
 }
 
-/// Request to create a pre-warmed VM template snapshot.
+/// Request to create a pre-warmed VM template snapshot by booting a fresh VM.
 pub struct CreateTemplateRequest {
     /// Unique identifier for this template entry.
     pub id: String,
-    /// Optional shell commands to run inside the VM before snapshotting.
-    /// These warm up the page cache with runtime libraries and common data.
-    pub warmup_commands: Vec<String>,
 }
 
 impl CreateTemplateRequest {
     pub fn new(id: impl Into<String>) -> Self {
-        Self {
-            id: id.into(),
-            warmup_commands: vec![],
-        }
-    }
-
-    pub fn with_warmup(mut self, commands: Vec<String>) -> Self {
-        self.warmup_commands = commands;
-        self
+        Self { id: id.into() }
     }
 }
 
@@ -342,7 +337,6 @@ mod tests {
             "/var/lib/kuasar/vmlinux.bin",
             2,
             512,
-            120,
             format!("/var/lib/kuasar/templates/{}/task.vsock", id),
             format!("/tmp/{}-task.log", id),
         )
@@ -358,7 +352,6 @@ mod tests {
         assert_eq!(loaded.key, tmpl.key);
         assert_eq!(loaded.vcpus, 2);
         assert_eq!(loaded.memory_mb, 512);
-        assert_eq!(loaded.warmup_ms, 120);
     }
 
     #[tokio::test]

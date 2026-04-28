@@ -16,6 +16,7 @@ limitations under the License.
 
 use std::{collections::HashMap, path::{Path, PathBuf}, str::FromStr};
 
+use anyhow::anyhow;
 use async_trait::async_trait;
 use containerd_sandbox::{
     error::{Error, Result},
@@ -139,8 +140,14 @@ pub struct SnapshotMeta {
 
 #[async_trait]
 pub trait Snapshottable {
-    async fn snapshot(&mut self, dest_dir: &Path) -> Result<SnapshotMeta>;
-    async fn restore(&mut self, src: &RestoreSource) -> Result<()>;
+    async fn snapshot(&mut self, dest_dir: &Path) -> Result<SnapshotMeta> {
+        let _ = dest_dir;
+        Err(anyhow!("snapshot not supported for this VM type").into())
+    }
+    async fn restore(&mut self, src: &RestoreSource) -> Result<()> {
+        let _ = src;
+        Err(anyhow!("restore not supported for this VM type").into())
+    }
 }
 
 #[derive(Deserialize, Debug, Clone)]

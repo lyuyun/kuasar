@@ -19,7 +19,7 @@ use std::{
     io::ErrorKind,
     path::{Path, PathBuf},
     sync::Arc,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 
 use anyhow::anyhow;
@@ -32,15 +32,26 @@ use containerd_sandbox::{
     utils::cleanup_mounts,
     ContainerOption, Sandbox, SandboxOption, SandboxStatus, Sandboxer,
 };
-use containerd_shim::{protos::api::Envelope, util::write_str_to_file};
+use containerd_shim::{
+    api::{CreateTaskRequest as TaskCreateRequest, StartRequest as TaskStartRequest},
+    protos::api::Envelope,
+    util::write_str_to_file,
+};
 use log::{debug, error, info, warn};
 use protobuf::{well_known_types::any::Any, MessageField};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use lazy_static::lazy_static;
 use tokio::{
     fs::{copy, create_dir_all, remove_dir_all, OpenOptions},
     io::{AsyncReadExt, AsyncWriteExt},
     sync::{Mutex, RwLock, Semaphore},
 };
+
+lazy_static! {
+    /// Limit concurrent VM restores to avoid exhausting host memory when many
+    /// sandboxes start simultaneously from template snapshots.
+    static ref RESTORE_SEMAPHORE: Semaphore = Semaphore::new(4);
+}
 use tracing::instrument;
 use ttrpc::context::with_timeout;
 use vmm_common::{
@@ -58,7 +69,7 @@ use crate::{
     cgroup::{SandboxCgroup, DEFAULT_CGROUP_PARENT_PATH},
     client::{
         client_check, client_setup_sandbox, client_sync_clock, new_sandbox_client,
-        new_sandbox_client_fail_fast, DEFAULT_CLIENT_CHECK_TIMEOUT,
+        new_sandbox_client_fail_fast, new_task_client, DEFAULT_CLIENT_CHECK_TIMEOUT,
     },
     container::KuasarContainer,
     network::{Network, NetworkConfig},
@@ -96,25 +107,6 @@ where
             sandboxes: Arc::new(Default::default()),
             template_pool: None,
         }
-    }
-
-    /// Initialize the template pool backed by `store_dir`.
-    ///
-    /// If `store_dir` already contains persisted templates from a previous run,
-    /// they are reloaded.  Call this once at startup before serving requests.
-    pub async fn init_template_pool(
-        &mut self,
-        store_dir: PathBuf,
-        max_per_key: usize,
-    ) -> Result<()> {
-        let pool = TemplatePool::load_from_disk(store_dir, max_per_key).await?;
-        info!(
-            "template pool initialized: {} templates across {} keys",
-            pool.total_depth().await,
-            0 // key count not exposed yet
-        );
-        self.template_pool = Some(pool);
-        Ok(())
     }
 
     /// Return pool metrics, if the pool has been initialized.
@@ -235,13 +227,16 @@ pub struct KuasarSandbox<V: VM> {
     pub(crate) exit_signal: Arc<ExitSignal>,
     #[serde(default)]
     pub(crate) sandbox_cgroups: SandboxCgroup,
+    /// Set when this sandbox was restored from a template snapshot.
+    #[serde(default)]
+    pub(crate) template_id: Option<String>,
 }
 
 #[async_trait]
 impl<F, H> Sandboxer for KuasarSandboxer<F, H>
 where
-    F: VMFactory + Sync + Send,
-    F::VM: VM + Sync + Send + 'static,
+    F: VMFactory + Clone + Sync + Send + 'static,
+    F::VM: VM + Snapshottable + Sync + Send + 'static,
     H: Hooks<F::VM> + Sync + Send,
 {
     type Sandbox = KuasarSandbox<F::VM>;
@@ -284,6 +279,7 @@ where
             client: Arc::new(Mutex::new(None)),
             exit_signal: Arc::new(ExitSignal::default()),
             sandbox_cgroups,
+            template_id: None,
         };
 
         // setup sandbox files: hosts, hostname and resolv.conf for guest
@@ -299,6 +295,20 @@ where
 
     #[instrument(skip_all)]
     async fn start(&self, id: &str) -> Result<()> {
+        // Template pool fast path: if a matching pre-warmed snapshot is available,
+        // restore from it instead of cold-booting.  Falls back to cold start
+        // automatically on pool miss or restore failure.
+        if let Some(pool) = &self.template_pool {
+            let key = TemplateKey::new(
+                self.factory.image_path(),
+                self.factory.vcpus(),
+                self.factory.memory_mb(),
+            );
+            if pool.depth(&key).await > 0 {
+                return self.start_with_template(id, &key).await;
+            }
+        }
+
         let sandbox_mutex = self.sandbox(id).await?;
         let mut sandbox = sandbox_mutex.lock().await;
         self.hooks.pre_start(&mut sandbox).await?;
@@ -422,8 +432,14 @@ where
     /// Start an already-created sandbox by restoring it from `snapshot_dir` rather than
     /// cold-booting the VM.  Falls back to a cold start if restore fails at any step.
     ///
-    /// The sandbox must have been previously created with `create()`.
-    pub async fn start_from_snapshot(&self, id: &str, snapshot_dir: &Path) -> Result<()> {
+    /// `template_id` is persisted to sandbox.json for audit when the restore came from
+    /// the template pool.  Pass `None` for a direct/one-off snapshot restore.
+    pub async fn start_from_snapshot(
+        &self,
+        id: &str,
+        snapshot_dir: &Path,
+        template_id: Option<String>,
+    ) -> Result<()> {
         let sandbox_mutex = self
             .sandboxes
             .read()
@@ -475,6 +491,9 @@ where
             sandbox.destroy_network().await;
             return Err(e);
         }
+
+        // Record which template this sandbox was restored from before persisting.
+        sandbox.template_id = template_id;
 
         if let Err(e) = sandbox.dump().await {
             if let Err(re) = sandbox.stop(true).await {
@@ -1259,10 +1278,9 @@ fn monitor<V: VM + 'static>(sandbox_mutex: Arc<Mutex<KuasarSandbox<V>>>) {
 // Template pool: create_template + start_with_template
 // ---------------------------------------------------------------------------
 
-/// Core template creation logic shared between `KuasarSandboxer::create_template`
-/// and the background refill task.  Isolated as a free function so it can be
-/// spawned without borrowing `self`.
-async fn create_template_worker<F>(
+/// Boot a fresh VM, wait for the guest agent, snapshot, then stop the VM.
+/// The resulting snapshot is added to the template pool and stored on disk.
+pub(crate) async fn create_template_worker<F>(
     factory: F,
     pool: Arc<TemplatePool>,
     req: CreateTemplateRequest,
@@ -1273,7 +1291,30 @@ where
 {
     let template_base = pool.store_dir.join(&req.id);
     let vm_base = template_base.join("vm");
-    tokio::fs::create_dir_all(&vm_base)
+
+    let result = create_template_inner(&factory, &pool, &req, &template_base, &vm_base).await;
+
+    if let Err(ref e) = result {
+        warn!("template {}: creation failed ({}), cleaning up", req.id, e);
+        if let Err(ce) = tokio::fs::remove_dir_all(&template_base).await {
+            warn!("template {}: cleanup on failure: {}", req.id, ce);
+        }
+    }
+    result
+}
+
+async fn create_template_inner<F>(
+    factory: &F,
+    pool: &Arc<TemplatePool>,
+    req: &CreateTemplateRequest,
+    template_base: &PathBuf,
+    vm_base: &PathBuf,
+) -> Result<PooledTemplate>
+where
+    F: VMFactory,
+    F::VM: VM + Snapshottable + Sync + Send,
+{
+    tokio::fs::create_dir_all(vm_base)
         .await
         .map_err(|e| anyhow!("create template vm dir: {}", e))?;
 
@@ -1288,25 +1329,23 @@ where
     let mut vm = factory.create_vm(&req.id, &sandbox_opt).await?;
     vm.start().await?;
 
-    // Execute optional warmup commands to pre-warm page cache before snapshotting.
-    let warmup_start = Instant::now();
-    if !req.warmup_commands.is_empty() {
-        let addr = vm.socket_address();
-        let client = new_sandbox_client_fail_fast(&addr)
+    // Wait for the guest agent to be ready, then flush fs journals and drop page
+    // cache to produce a clean, compact snapshot.
+    let agent_client = new_sandbox_client_fail_fast(&vm.socket_address())
+        .await
+        .map_err(|e| anyhow!("template {}: connect to agent: {}", req.id, e))?;
+    let pre_snap_timeout_ns = Duration::from_secs(10).as_nanos() as i64;
+    for cmd in &["sync", "echo 1 > /proc/sys/vm/drop_caches"] {
+        let mut exec_req = ExecVMProcessRequest::new();
+        exec_req.command = cmd.to_string();
+        exec_req.stdin = vec![];
+        if let Err(e) = agent_client
+            .exec_vm_process(with_timeout(pre_snap_timeout_ns), &exec_req)
             .await
-            .map_err(|e| anyhow!("template {}: connect to agent for warmup: {}", req.id, e))?;
-        let timeout_ns = Duration::from_secs(30).as_nanos() as i64;
-        for cmd in &req.warmup_commands {
-            let mut exec_req = ExecVMProcessRequest::new();
-            exec_req.command = cmd.clone();
-            exec_req.stdin = vec![];
-            client
-                .exec_vm_process(with_timeout(timeout_ns), &exec_req)
-                .await
-                .map_err(|e| anyhow!("template {}: warmup '{}': {}", req.id, cmd, e))?;
+        {
+            warn!("template {}: pre-snapshot '{}' failed: {}", req.id, cmd, e);
         }
     }
-    let warmup_ms = warmup_start.elapsed().as_millis() as u64;
 
     let snapshot_dir = template_base.join("snapshot");
     tokio::fs::create_dir_all(&snapshot_dir)
@@ -1314,9 +1353,10 @@ where
         .map_err(|e| anyhow!("create snapshot dir: {}", e))?;
 
     let snap_start = Instant::now();
-    let meta: SnapshotMeta = vm.snapshot(&snapshot_dir).await.map_err(|e| {
-        anyhow!("template {}: snapshot failed: {}", req.id, e)
-    })?;
+    let meta: SnapshotMeta = vm
+        .snapshot(&snapshot_dir)
+        .await
+        .map_err(|e| anyhow!("template {}: snapshot failed: {}", req.id, e))?;
     info!(
         "template {}: snapshot captured in {:.3}s",
         req.id,
@@ -1325,6 +1365,12 @@ where
 
     if let Err(e) = vm.stop(false).await {
         warn!("template {}: stop after snapshot: {}", req.id, e);
+    }
+
+    // Remove the temporary VM directory (sockets, sandbox.json, etc.); only the
+    // snapshot directory under template_base is retained.
+    if let Err(e) = tokio::fs::remove_dir_all(vm_base).await {
+        warn!("template {}: cleanup vm dir: {}", req.id, e);
     }
 
     let key = TemplateKey::new(factory.image_path(), factory.vcpus(), factory.memory_mb());
@@ -1336,19 +1382,234 @@ where
         factory.kernel_path(),
         factory.vcpus(),
         factory.memory_mb(),
-        warmup_ms,
         meta.original_task_vsock,
         meta.original_console_path,
     );
 
     pool.add(tmpl.clone()).await?;
     info!(
-        "template {}: added to pool (warmup={}ms, pool_depth={})",
+        "template {}: added to pool (pool_depth={})",
         req.id,
-        warmup_ms,
         pool.depth(&tmpl.key).await
     );
     Ok(tmpl)
+}
+
+/// Boot a fresh VM, optionally start a container from `image` via the shimv2 task API,
+/// then snapshot the VM and register the result as a template.
+///
+/// If `image` is empty, the VM is snapshotted immediately after the guest agent is ready
+/// (equivalent to the old "create-fresh" behaviour).
+pub(crate) async fn create_template_from_image_worker<F>(
+    factory: F,
+    pool: Arc<TemplatePool>,
+    req: CreateTemplateRequest,
+    image: String,
+) -> Result<PooledTemplate>
+where
+    F: VMFactory,
+    F::VM: VM + Snapshottable + Sync + Send,
+{
+    let template_base = pool.store_dir.join(&req.id);
+    let vm_base = template_base.join("vm");
+
+    let result =
+        create_template_from_image_inner(&factory, &pool, &req, &image, &template_base, &vm_base)
+            .await;
+
+    if let Err(ref e) = result {
+        warn!("template {}: creation failed ({}), cleaning up", req.id, e);
+        if let Err(ce) = tokio::fs::remove_dir_all(&template_base).await {
+            warn!("template {}: cleanup on failure: {}", req.id, ce);
+        }
+    }
+    result
+}
+
+async fn create_template_from_image_inner<F>(
+    factory: &F,
+    pool: &Arc<TemplatePool>,
+    req: &CreateTemplateRequest,
+    image: &str,
+    template_base: &PathBuf,
+    vm_base: &PathBuf,
+) -> Result<PooledTemplate>
+where
+    F: VMFactory,
+    F::VM: VM + Snapshottable + Sync + Send,
+{
+    tokio::fs::create_dir_all(vm_base)
+        .await
+        .map_err(|e| anyhow!("create template vm dir: {}", e))?;
+
+    let sandbox_opt = SandboxOption {
+        base_dir: vm_base.to_string_lossy().to_string(),
+        sandbox: SandboxData {
+            id: req.id.clone(),
+            ..Default::default()
+        },
+    };
+
+    let mut vm = factory.create_vm(&req.id, &sandbox_opt).await?;
+    vm.start().await?;
+
+    let agent_addr = vm.socket_address();
+    let agent_client = new_sandbox_client_fail_fast(&agent_addr)
+        .await
+        .map_err(|e| anyhow!("template {}: connect to agent: {}", req.id, e))?;
+
+    if !image.is_empty() {
+        start_warmup_container(req, image, &agent_addr, &agent_client).await?;
+    }
+
+    // Flush fs journals and drop page cache before snapshot.
+    let pre_snap_timeout_ns = Duration::from_secs(10).as_nanos() as i64;
+    for cmd in &["sync", "echo 1 > /proc/sys/vm/drop_caches"] {
+        let mut exec_req = ExecVMProcessRequest::new();
+        exec_req.command = cmd.to_string();
+        exec_req.stdin = vec![];
+        if let Err(e) = agent_client
+            .exec_vm_process(with_timeout(pre_snap_timeout_ns), &exec_req)
+            .await
+        {
+            warn!("template {}: pre-snapshot '{}' failed: {}", req.id, cmd, e);
+        }
+    }
+
+    let snapshot_dir = template_base.join("snapshot");
+    tokio::fs::create_dir_all(&snapshot_dir)
+        .await
+        .map_err(|e| anyhow!("create snapshot dir: {}", e))?;
+
+    let snap_start = Instant::now();
+    let meta: SnapshotMeta = vm
+        .snapshot(&snapshot_dir)
+        .await
+        .map_err(|e| anyhow!("template {}: snapshot failed: {}", req.id, e))?;
+    info!(
+        "template {}: snapshot captured in {:.3}s",
+        req.id,
+        snap_start.elapsed().as_secs_f64()
+    );
+
+    if let Err(e) = vm.stop(false).await {
+        warn!("template {}: stop after snapshot: {}", req.id, e);
+    }
+
+    if let Err(e) = tokio::fs::remove_dir_all(vm_base).await {
+        warn!("template {}: cleanup vm dir: {}", req.id, e);
+    }
+
+    let key = TemplateKey::new(factory.image_path(), factory.vcpus(), factory.memory_mb());
+    let tmpl = PooledTemplate::new(
+        &req.id,
+        key,
+        meta.snapshot_dir,
+        factory.image_path(),
+        factory.kernel_path(),
+        factory.vcpus(),
+        factory.memory_mb(),
+        meta.original_task_vsock,
+        meta.original_console_path,
+    );
+
+    pool.add(tmpl.clone()).await?;
+    info!(
+        "template {}: added to pool (pool_depth={})",
+        req.id,
+        pool.depth(&tmpl.key).await
+    );
+    Ok(tmpl)
+}
+
+/// Push a minimal OCI bundle into the VM via exec_vm_process and start a warmup
+/// container via the shimv2 task API.  Works in virtio-blk mode (no shared fs).
+async fn start_warmup_container(
+    req: &CreateTemplateRequest,
+    image: &str,
+    agent_addr: &str,
+    agent_client: &SandboxServiceClient,
+) -> Result<()> {
+    let container_id = format!("warmup-{}", &req.id);
+    let bundle_guest = format!("{}/{}", KUASAR_STATE_DIR, container_id);
+    let push_timeout_ns = Duration::from_secs(10).as_nanos() as i64;
+
+    // Create bundle dir inside the VM.
+    let mut mkdir_req = ExecVMProcessRequest::new();
+    mkdir_req.command = format!("mkdir -p {}", bundle_guest);
+    mkdir_req.stdin = vec![];
+    agent_client
+        .exec_vm_process(with_timeout(push_timeout_ns), &mkdir_req)
+        .await
+        .map_err(|e| anyhow!("template {}: mkdir bundle dir: {}", req.id, e))?;
+
+    // Push config.json into the VM via tee.
+    let spec = minimal_warmup_oci_spec(image);
+    let mut tee_req = ExecVMProcessRequest::new();
+    tee_req.command = format!("tee {}/config.json", bundle_guest);
+    tee_req.stdin = spec.into_bytes();
+    agent_client
+        .exec_vm_process(with_timeout(push_timeout_ns), &tee_req)
+        .await
+        .map_err(|e| anyhow!("template {}: push config.json: {}", req.id, e))?;
+
+    // Connect to the vmm-task service (same vsock port 1024 as the agent).
+    let task_client = new_task_client(agent_addr)
+        .await
+        .map_err(|e| anyhow!("template {}: connect to task service: {}", req.id, e))?;
+
+    let ctx_ns = Duration::from_secs(30).as_nanos() as i64;
+
+    let mut create_req = TaskCreateRequest::new();
+    create_req.id = container_id.clone();
+    create_req.stdin = "/dev/null".to_string();
+    create_req.stdout = "/dev/null".to_string();
+    create_req.stderr = "/dev/null".to_string();
+    create_req.terminal = false;
+
+    task_client
+        .create(with_timeout(ctx_ns), &create_req)
+        .await
+        .map_err(|e| anyhow!("template {}: task.Create failed: {}", req.id, e))?;
+
+    let mut start_req = TaskStartRequest::new();
+    start_req.id = container_id.clone();
+
+    task_client
+        .start(with_timeout(ctx_ns), &start_req)
+        .await
+        .map_err(|e| anyhow!("template {}: task.Start failed: {}", req.id, e))?;
+
+    info!(
+        "template {}: warmup container {} started (image={})",
+        req.id, container_id, image
+    );
+    Ok(())
+}
+
+/// Minimal OCI spec that runs `sleep infinity` inside the VM's own rootfs.
+/// The `io.kuasar.storages` annotation prevents vmm-task from looking for a
+/// storages file that doesn't exist.
+fn minimal_warmup_oci_spec(image: &str) -> String {
+    let image_json = serde_json::to_string(image).unwrap_or_else(|_| "\"\"".to_string());
+    format!(
+        r#"{{
+  "ociVersion": "1.0.0",
+  "process": {{
+    "terminal": false,
+    "user": {{"uid": 0, "gid": 0}},
+    "args": ["/bin/sh", "-c", "exec sleep infinity"],
+    "env": ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"],
+    "cwd": "/"
+  }},
+  "root": {{"path": "/", "readonly": false}},
+  "linux": {{"namespaces": []}},
+  "annotations": {{
+    "io.kuasar.storages": "[]",
+    "io.kuasar.template.image": {image_json}
+  }}
+}}"#
+    )
 }
 
 impl<F, H> KuasarSandboxer<F, H>
@@ -1357,12 +1618,43 @@ where
     F::VM: VM + Snapshottable + Sync + Send + 'static,
     H: Hooks<F::VM> + Sync + Send,
 {
-    /// Create a pre-warmed VM snapshot and add it to the template pool.
+    /// Initialize the template pool from `store_dir`, rehydrating any previously
+    /// persisted templates.
     ///
-    /// Spins up a temporary VM, optionally runs warmup commands, snapshots it,
-    /// stops it, and stores the resulting template.  The temporary VM files are
-    /// kept under `{pool.store_dir}/{req.id}/vm/`; only the snapshot dir is
-    /// retained after the VM stops.
+    /// Must be called before `create_template` or `start_with_template`.
+    pub async fn init_template_pool(
+        &mut self,
+        store_dir: impl Into<PathBuf>,
+        max_per_key: usize,
+    ) -> Result<()> {
+        let store_dir = store_dir.into();
+        let pool = TemplatePool::load_from_disk(store_dir, max_per_key).await?;
+        let total = pool.total_depth().await;
+        let keys = pool.key_count().await;
+        info!(
+            "template pool initialized: {} templates across {} key(s) (store={})",
+            total,
+            keys,
+            pool.store_dir.display(),
+        );
+        self.template_pool = Some(pool);
+        Ok(())
+    }
+
+    /// Return a handle that exposes template-management operations over the admin
+    /// socket without requiring ownership of the whole sandboxer.
+    ///
+    /// Returns `None` when the template pool has not been initialized.
+    pub fn admin_handle(&self) -> Option<crate::admin::TemplateAdminHandle<F>> {
+        self.template_pool.as_ref().map(|pool| crate::admin::TemplateAdminHandle {
+            factory: self.factory.clone(),
+            sandboxes: self.sandboxes.clone(),
+            pool: pool.clone(),
+        })
+    }
+
+    /// Boot a fresh VM, snapshot it once the guest agent is ready, stop it, and
+    /// add the resulting snapshot to the template pool.
     pub async fn create_template(&self, req: CreateTemplateRequest) -> Result<PooledTemplate> {
         let pool = self
             .template_pool
@@ -1399,37 +1691,61 @@ where
                 self.start_cold(id).await
             }
             Some(tmpl) => {
+                // Validate snapshot files before acquiring the restore semaphore slot.
+                let state_json = tmpl.snapshot_dir.join("state.json");
+                let snapshot_ok = tokio::fs::metadata(&state_json).await.is_ok()
+                    && tokio::fs::metadata(&tmpl.pmem_path).await.is_ok();
+                if !snapshot_ok {
+                    warn!(
+                        "sandbox {}: template {} snapshot files missing, releasing and cold-starting",
+                        id, tmpl.id
+                    );
+                    pool.release(tmpl).await;
+                    pool.metrics.record_miss();
+                    return self.start_cold(id).await;
+                }
+
+                // Limit concurrent VM restores to cap host memory pressure during bursts.
+                let _permit = RESTORE_SEMAPHORE.acquire().await.unwrap();
+
                 let restore_start = Instant::now();
+                let template_id = tmpl.id.clone();
                 info!(
                     "template pool hit for sandbox {} (template {}), restoring",
                     id, tmpl.id
                 );
-                match self.start_from_snapshot(id, &tmpl.snapshot_dir).await {
+                match self
+                    .start_from_snapshot(id, &tmpl.snapshot_dir, Some(template_id.clone()))
+                    .await
+                {
                     Ok(()) => {
                         let ms = restore_start.elapsed().as_millis() as u64;
                         pool.metrics.record_hit(ms);
+
+                        // Log aggregate pool metrics every 10 successful restores.
+                        let hits = pool
+                            .metrics
+                            .pool_hits
+                            .load(std::sync::atomic::Ordering::Relaxed);
+                        if hits > 0 && hits % 10 == 0 {
+                            info!(
+                                "template pool: hit_rate={:.1}%, avg_restore={}ms, hits={}, misses={}",
+                                pool.metrics.hit_rate() * 100.0,
+                                pool.metrics.avg_restore_ms() as u64,
+                                hits,
+                                pool.metrics
+                                    .pool_misses
+                                    .load(std::sync::atomic::Ordering::Relaxed),
+                            );
+                        }
+
                         info!(
                             "sandbox {} restored from template {} in {}ms (pool hit_rate={:.1}%)",
                             id,
-                            tmpl.id,
+                            template_id,
                             ms,
                             pool.metrics.hit_rate() * 100.0
                         );
-                        // Background refill: replace the consumed template asynchronously
-                        let factory = self.factory.clone();
-                        let pool2 = pool.clone();
-                        let refill_id = format!("tmpl-refill-{}", next_template_id());
-                        tokio::spawn(async move {
-                            if let Err(e) = create_template_worker(
-                                factory,
-                                pool2,
-                                CreateTemplateRequest::new(refill_id),
-                            )
-                            .await
-                            {
-                                warn!("template pool background refill failed: {}", e);
-                            }
-                        });
                         Ok(())
                     }
                     Err(e) => {
@@ -1505,18 +1821,6 @@ where
     }
 }
 
-/// Generate a short unique ID for background-refill templates.
-/// Uses a monotonic counter + timestamp to avoid pulling in the uuid crate.
-fn next_template_id() -> String {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("{:x}-{:04x}", ts, n)
-}
 
 #[cfg(test)]
 mod tests {
@@ -1649,6 +1953,7 @@ mod tests {
                 client: Arc::new(Mutex::new(None)),
                 exit_signal: Arc::new(ExitSignal::default()),
                 sandbox_cgroups: SandboxCgroup::default(),
+                template_id: None,
             }
         }
 

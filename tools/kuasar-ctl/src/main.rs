@@ -16,12 +16,16 @@ limitations under the License.
 
 use anyhow::{anyhow, Context, Result};
 use clap::Parser;
+use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::time::timeout as tokio_timeout;
 
 mod sandbox;
+mod template;
+
+const DEFAULT_ADMIN_SOCK: &str = "/run/kuasar-vmm-admin.sock";
 
 const EXIT_MARKER: &str = "__KSR_EXIT__";
 const INTERRUPTED_EXIT_CODE: i32 = 130;
@@ -50,6 +54,39 @@ enum Commands {
         #[arg(short = 't', long = "timeout")]
         timeout: Option<u64>,
     },
+    /// Manage VM template snapshots in the template pool
+    Template {
+        #[command(subcommand)]
+        action: TemplateAction,
+    },
+}
+
+#[derive(clap::Subcommand)]
+enum TemplateAction {
+    /// Create a VM template snapshot and register it in the template pool.
+    ///
+    /// Without --sandbox or --image, boots a fresh VM and snapshots it once the
+    /// guest agent is ready.
+    ///
+    /// With --sandbox <id>: the running sandbox's VM is paused, snapshotted, and
+    /// immediately resumed so the original container keeps running.
+    ///
+    /// With --image <ref>: boots a fresh VM, starts a warmup container using the
+    /// specified image via the shimv2 task API, then snapshots the VM.
+    Create {
+        /// Unique name for the template (auto-generated if omitted)
+        #[arg(long)]
+        id: Option<String>,
+        /// Admin socket of the running vmm-sandboxer
+        #[arg(long, default_value = DEFAULT_ADMIN_SOCK)]
+        admin_sock: PathBuf,
+        /// Snapshot a running sandbox instead of booting a fresh VM
+        #[arg(long, conflicts_with = "image")]
+        sandbox: Option<String>,
+        /// Boot a fresh VM and start this container image before snapshotting
+        #[arg(long, conflicts_with = "sandbox")]
+        image: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -74,6 +111,45 @@ async fn run() -> Result<i32> {
     let cli = Cli::parse();
 
     match cli.command {
+        Commands::Template {
+            action:
+                TemplateAction::Create {
+                    id,
+                    admin_sock,
+                    sandbox,
+                    image,
+                },
+        } => {
+            let ts = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            if let Some(sandbox_id) = sandbox {
+                let tid = id.unwrap_or_else(|| {
+                    format!("tmpl-{}-{}", &sandbox_id[..sandbox_id.len().min(8)], ts)
+                });
+                template::create_from_sandbox(&admin_sock, &sandbox_id, &tid)
+                    .await
+                    .map(|_| 0)
+            } else {
+                let img = image.unwrap_or_default();
+                let tid = id.unwrap_or_else(|| {
+                    if img.is_empty() {
+                        format!("tmpl-fresh-{}", ts)
+                    } else {
+                        let short: String = img
+                            .chars()
+                            .filter(|c| c.is_alphanumeric() || *c == '-')
+                            .take(12)
+                            .collect();
+                        format!("tmpl-{}-{}", short, ts)
+                    }
+                });
+                template::create_from_image(&admin_sock, &img, &tid)
+                    .await
+                    .map(|_| 0)
+            }
+        }
         Commands::Exec {
             sandbox,
             command,

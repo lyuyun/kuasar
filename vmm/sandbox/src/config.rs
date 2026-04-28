@@ -26,6 +26,17 @@ use crate::sandbox::SandboxConfig;
 pub struct Config<T> {
     pub sandbox: SandboxConfig,
     pub hypervisor: T,
+    #[serde(default)]
+    pub template_pool: Option<TemplatePoolConfig>,
+}
+
+#[derive(Deserialize, Default)]
+pub struct TemplatePoolConfig {
+    /// Directory where template snapshots are persisted across restarts.
+    pub store_dir: String,
+    /// Maximum templates retained per TemplateKey; oldest evicted when exceeded.
+    #[serde(default)]
+    pub max_per_key: Option<usize>,
 }
 
 impl<T: DeserializeOwned> Config<T> {
@@ -33,6 +44,7 @@ impl<T: DeserializeOwned> Config<T> {
         Self {
             sandbox,
             hypervisor,
+            template_pool: None,
         }
     }
 
