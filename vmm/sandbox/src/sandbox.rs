@@ -1007,7 +1007,7 @@ where
         let push_hostname = async {
             if let Some(content) = hostname_content {
                 let mut req = ExecVMProcessRequest::new();
-                req.command = format!("tee {}/{}", KUASAR_STATE_DIR, HOSTNAME_FILENAME);
+                req.command = format!("cat > {}/{}", KUASAR_STATE_DIR, HOSTNAME_FILENAME);
                 req.stdin = content;
                 client
                     .exec_vm_process(with_timeout(timeout_ns), &req)
@@ -1021,8 +1021,8 @@ where
             if let Some(content) = resolv_content {
                 let mut req = ExecVMProcessRequest::new();
                 req.command = format!(
-                    "tee {}/{} && tee /etc/resolv.conf",
-                    KUASAR_STATE_DIR, RESOLV_FILENAME
+                    "cat > {}/{} && cp {}/{} /etc/resolv.conf",
+                    KUASAR_STATE_DIR, RESOLV_FILENAME, KUASAR_STATE_DIR, RESOLV_FILENAME
                 );
                 req.stdin = content;
                 client
@@ -1036,7 +1036,7 @@ where
         let push_hosts = async {
             if let Some(content) = hosts_content {
                 let mut req = ExecVMProcessRequest::new();
-                req.command = format!("tee {}/{}", KUASAR_STATE_DIR, HOSTS_FILENAME);
+                req.command = format!("cat > {}/{}", KUASAR_STATE_DIR, HOSTS_FILENAME);
                 req.stdin = content;
                 client
                     .exec_vm_process(with_timeout(timeout_ns), &req)
@@ -1543,13 +1543,13 @@ async fn start_warmup_container(
         .await
         .map_err(|e| anyhow!("template {}: mkdir bundle dir: {}", req.id, e))?;
 
-    // Push config.json into the VM via tee.
+    // Push config.json into the VM.
     let spec = minimal_warmup_oci_spec(image);
-    let mut tee_req = ExecVMProcessRequest::new();
-    tee_req.command = format!("tee {}/config.json", bundle_guest);
-    tee_req.stdin = spec.into_bytes();
+    let mut push_req = ExecVMProcessRequest::new();
+    push_req.command = format!("cat > {}/config.json", bundle_guest);
+    push_req.stdin = spec.into_bytes();
     agent_client
-        .exec_vm_process(with_timeout(push_timeout_ns), &tee_req)
+        .exec_vm_process(with_timeout(push_timeout_ns), &push_req)
         .await
         .map_err(|e| anyhow!("template {}: push config.json: {}", req.id, e))?;
 
