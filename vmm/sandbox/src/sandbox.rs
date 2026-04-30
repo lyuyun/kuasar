@@ -1021,7 +1021,7 @@ where
             if let Some(content) = resolv_content {
                 let mut req = ExecVMProcessRequest::new();
                 req.command = format!(
-                    "cat > {}/{} && cp {}/{} /etc/resolv.conf",
+                    "cat > {}/{} && mount --bind {}/{} /etc/resolv.conf",
                     KUASAR_STATE_DIR, RESOLV_FILENAME, KUASAR_STATE_DIR, RESOLV_FILENAME
                 );
                 req.stdin = content;
