@@ -687,7 +687,7 @@ where
             let qdest = shell_quote(dest_path);
             let mut req = ExecVMProcessRequest::new();
             req.command = format!(
-                "mkdir -p {} && tee {} && chmod {:o} {}",
+                "mkdir -p {} && cat > {} && chmod {:o} {}",
                 qparent, qdest, mode, qdest
             );
             req.stdin = content;
