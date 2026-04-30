@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::path::Path;
+use std::{path::Path, time::Duration};
 
 use anyhow::anyhow;
 use async_trait::async_trait;
@@ -24,13 +24,18 @@ use containerd_sandbox::{
 };
 use log::debug;
 use path_clean::clean;
+use ttrpc::context::with_timeout;
 use vmm_common::{
+    api::sandbox::ExecVMProcessRequest,
     ETC_HOSTNAME, ETC_HOSTS, ETC_RESOLV, HOSTNAME_FILENAME, HOSTS_FILENAME, KUASAR_STATE_DIR,
     RESOLV_FILENAME,
 };
 
 use crate::{
-    container::handler::Handler, sandbox::KuasarSandbox, utils::write_file_atomic, vm::VM,
+    container::handler::Handler,
+    sandbox::KuasarSandbox,
+    utils::write_file_atomic,
+    vm::{SHAREFS_VIRTIO_BLK, VM},
 };
 
 const CONFIG_FILE_NAME: &str = "config.json";
@@ -91,6 +96,38 @@ where
             .map_err(|e| anyhow!("failed to parse spec in sandbox, {}", e))?;
         let config_path = format!("{}/{}", container.data.bundle, CONFIG_FILE_NAME);
         write_file_atomic(config_path, &spec_str).await?;
+
+        // In virtio-blk mode there is no shared filesystem between host and guest.
+        // Push config.json directly into the VM via exec_vm_process.
+        if sandbox.vm.sharefs_type() == SHAREFS_VIRTIO_BLK {
+            let client_guard = sandbox.client.lock().await;
+            if let Some(client) = client_guard.as_ref() {
+                let timeout_ns = Duration::from_secs(10).as_nanos() as i64;
+                let bundle_guest =
+                    format!("{}/{}", KUASAR_STATE_DIR, self.container_id);
+
+                let mut mkdir_req = ExecVMProcessRequest::new();
+                mkdir_req.command = format!("mkdir -p {}", bundle_guest);
+                mkdir_req.stdin = vec![];
+                client
+                    .exec_vm_process(with_timeout(timeout_ns), &mkdir_req)
+                    .await
+                    .map_err(|e| {
+                        anyhow!("mkdir bundle dir in guest for {}: {}", self.container_id, e)
+                    })?;
+
+                let mut push_req = ExecVMProcessRequest::new();
+                push_req.command = format!("cat > {}/{}", bundle_guest, CONFIG_FILE_NAME);
+                push_req.stdin = spec_str.into_bytes();
+                client
+                    .exec_vm_process(with_timeout(timeout_ns), &push_req)
+                    .await
+                    .map_err(|e| {
+                        anyhow!("push config.json to guest for {}: {}", self.container_id, e)
+                    })?;
+            }
+        }
+
         Ok(())
     }
 
