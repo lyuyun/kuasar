@@ -381,8 +381,19 @@ impl VM for CloudHypervisorVM {
 impl crate::vm::Recoverable for CloudHypervisorVM {
     #[instrument(skip_all)]
     async fn recover(&mut self) -> Result<()> {
-        self.client = Some(self.create_client().await?);
         let pid = self.pid()?;
+        // Fast-fail: if the process is gone, skip the 10-s socket connect timeout.
+        signal::kill(Pid::from_raw(pid as i32), None).map_err(|_| {
+            anyhow!("vm process {} is no longer running", pid)
+        })?;
+        if !std::path::Path::new(&self.config.api_socket).exists() {
+            return Err(anyhow!(
+                "api socket {} does not exist, vm process may have died",
+                self.config.api_socket
+            )
+            .into());
+        }
+        self.client = Some(self.create_client().await?);
         let (tx, rx) = channel((0u32, 0i128));
         tokio::spawn(async move {
             let wait_result = wait_pid(pid as i32).await;
