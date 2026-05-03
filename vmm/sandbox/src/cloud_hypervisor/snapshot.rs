@@ -65,19 +65,20 @@ pub async fn patch_snapshot_config(
     let mut cfg: serde_json::Value =
         serde_json::from_str(&content).map_err(|e| anyhow!("parse config.json: {}", e))?;
 
-    // vsock socket path — required; fail early if structure is unexpected
-    match cfg.pointer_mut("/payload/vsock/socket_path") {
+    // vsock socket path — required; fail early if structure is unexpected.
+    // CH config.json: vsock is a top-level field with a "socket" key (not under "payload").
+    match cfg.pointer_mut("/vsock/socket") {
         Some(v) => *v = serde_json::Value::String(overrides.task_vsock.clone()),
         None => {
             return Err(
-                anyhow!("config.json missing /payload/vsock/socket_path — CH version mismatch?")
+                anyhow!("config.json missing /vsock/socket — unexpected CH config format")
                     .into(),
             )
         }
     }
 
     // console log file — optional (may not be present in all CH configs)
-    if let Some(v) = cfg.pointer_mut("/payload/console/file") {
+    if let Some(v) = cfg.pointer_mut("/console/file") {
         *v = serde_json::Value::String(overrides.console_path.clone());
     }
 
@@ -98,20 +99,25 @@ mod tests {
         let src = dir.path().join("config.json");
         let dst = dir.path().join("config_patched.json");
 
+        // Mirrors actual CH config.json: vsock and console are top-level fields.
+        // "payload" in CH config is only for kernel/cmdline/initramfs.
         let original = serde_json::json!({
             "payload": {
-                "vsock": {
-                    "socket_path": "/old/sandbox-abc/task.vsock",
-                    "cid": 3
-                },
-                "console": {
-                    "file": "/tmp/sandbox-abc-task.log",
-                    "mode": "File"
-                },
-                "pmem": [
-                    {"file": "/var/lib/kuasar/rootfs.img", "discard_writes": true}
-                ]
-            }
+                "kernel": "/var/lib/kuasar/vmlinux.bin",
+                "cmdline": "console=hvc0 root=/dev/pmem0p1 ro"
+            },
+            "vsock": {
+                "socket": "/old/sandbox-abc/task.vsock",
+                "cid": 3,
+                "iommu": false
+            },
+            "console": {
+                "file": "/tmp/sandbox-abc-task.log",
+                "mode": "File"
+            },
+            "pmem": [
+                {"file": "/var/lib/kuasar/rootfs.img", "discard_writes": true}
+            ]
         });
         tokio::fs::write(&src, serde_json::to_string_pretty(&original).unwrap())
             .await
@@ -127,16 +133,16 @@ mod tests {
             serde_json::from_str(&tokio::fs::read_to_string(&dst).await.unwrap()).unwrap();
 
         assert_eq!(
-            patched["payload"]["vsock"]["socket_path"],
+            patched["vsock"]["socket"],
             "/new/sandbox-xyz/task.vsock"
         );
         assert_eq!(
-            patched["payload"]["console"]["file"],
+            patched["console"]["file"],
             "/tmp/sandbox-xyz-task.log"
         );
         // pmem path must remain unchanged
         assert_eq!(
-            patched["payload"]["pmem"][0]["file"],
+            patched["pmem"][0]["file"],
             "/var/lib/kuasar/rootfs.img"
         );
     }
@@ -175,7 +181,7 @@ mod tests {
         let dst = dir.path().join("config_patched.json");
 
         // config.json without vsock field
-        let cfg = serde_json::json!({ "payload": { "pmem": [] } });
+        let cfg = serde_json::json!({ "pmem": [], "console": { "mode": "Null" } });
         tokio::fs::write(&src, serde_json::to_string_pretty(&cfg).unwrap())
             .await
             .unwrap();
@@ -187,6 +193,6 @@ mod tests {
         let result = patch_snapshot_config(&src, &dst, &overrides).await;
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("missing /payload/vsock/socket_path"), "got: {}", msg);
+        assert!(msg.contains("missing /vsock/socket"), "got: {}", msg);
     }
 }
