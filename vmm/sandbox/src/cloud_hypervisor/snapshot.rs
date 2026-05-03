@@ -82,6 +82,14 @@ pub async fn patch_snapshot_config(
         *v = serde_json::Value::String(overrides.console_path.clone());
     }
 
+    // Strip hot-plugged container blk devices from the restore config.
+    // These paths (e.g. {sandbox_dir}/{storage_id}.img) are per-sandbox and do not
+    // exist in the new sandbox's directory. Containers re-attach their blk devices
+    // via hot-plug after the VM is restored, so clearing this array is safe.
+    if let Some(disks) = cfg.get_mut("disks") {
+        *disks = serde_json::Value::Array(vec![]);
+    }
+
     let serialized = serde_json::to_string_pretty(&cfg)
         .map_err(|e| anyhow!("serialize patched config.json: {}", e))?;
     write_file_atomic(dst, &serialized).await
@@ -101,6 +109,7 @@ mod tests {
 
         // Mirrors actual CH config.json: vsock and console are top-level fields.
         // "payload" in CH config is only for kernel/cmdline/initramfs.
+        // "disks" contains hot-plugged container blk images (per-sandbox, must be stripped).
         let original = serde_json::json!({
             "payload": {
                 "kernel": "/var/lib/kuasar/vmlinux.bin",
@@ -117,6 +126,9 @@ mod tests {
             },
             "pmem": [
                 {"file": "/var/lib/kuasar/rootfs.img", "discard_writes": true}
+            ],
+            "disks": [
+                {"path": "/old/sandbox-abc/container-1.img", "readonly": false}
             ]
         });
         tokio::fs::write(&src, serde_json::to_string_pretty(&original).unwrap())
@@ -145,6 +157,8 @@ mod tests {
             patched["pmem"][0]["file"],
             "/var/lib/kuasar/rootfs.img"
         );
+        // container blk devices must be stripped — they will be re-hot-plugged after restore
+        assert_eq!(patched["disks"], serde_json::json!([]));
     }
 
     #[tokio::test]

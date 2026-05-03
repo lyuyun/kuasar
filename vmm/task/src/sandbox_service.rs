@@ -33,6 +33,7 @@ use log::debug;
 use nix::{
     sys::time::{TimeSpec, TimeValLike},
     time::{clock_gettime, clock_settime, ClockId},
+    unistd::sync as nix_sync,
 };
 use tokio::sync::{mpsc::Receiver, Mutex};
 use vmm_common::{
@@ -142,6 +143,13 @@ impl api::sandbox_ttrpc::SandboxService for SandboxService {
         _ctx: &TtrpcContext,
         req: ExecVMProcessRequest,
     ) -> TtrpcResult<ExecVMProcessResponse> {
+        // Intercept "sync" and call the syscall directly to avoid depending on
+        // the sync(1) binary, which may not be present in the guest rootfs.
+        if req.command.trim() == "sync" {
+            nix_sync();
+            return Ok(ExecVMProcessResponse::new());
+        }
+
         let out = do_execute_cmd(&req.command, req.stdin.as_slice()).await?;
 
         let mut resp = ExecVMProcessResponse::new();
