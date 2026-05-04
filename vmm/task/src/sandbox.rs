@@ -344,9 +344,17 @@ async fn setup_persistent_ns(ns_types: Vec<String>) -> Result<()> {
     mkdir(SANDBOX_NS_PATH, 0o711).await?;
 
     let mut clone_type = CloneFlags::empty();
+    let mut ns_to_setup = Vec::new();
 
     for ns_type in &ns_types {
         let sandbox_ns_path = format!("{}/{}", SANDBOX_NS_PATH, ns_type);
+        // If the path already exists OR stat() itself returns EPERM (bind mount present
+        // but namespace inaccessible after restore), the mount is live — skip re-creating.
+        match tokio::fs::metadata(&sandbox_ns_path).await {
+            Ok(_) => continue,
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => continue,
+            Err(_) => {}
+        }
         File::create(&sandbox_ns_path).await.map_err(io_error!(
             e,
             "failed to create: {}",
@@ -356,9 +364,12 @@ async fn setup_persistent_ns(ns_types: Vec<String>) -> Result<()> {
         clone_type |= *CLONE_FLAG_TABLE
             .get(ns_type)
             .ok_or(other!("bad ns type {}", ns_type))?;
+        ns_to_setup.push(ns_type.clone());
     }
 
-    fork_sandbox(ns_types, clone_type)?;
+    if !ns_to_setup.is_empty() {
+        fork_sandbox(ns_to_setup, clone_type)?;
+    }
 
     Ok(())
 }
