@@ -72,6 +72,11 @@ pub struct PooledTemplate {
     /// called inside the guest). On restore we skip the setup_sandbox RPC in this case.
     #[serde(default)]
     pub ns_preinitialized: bool,
+    /// The id_generator value of the sandbox that was snapshotted.  Restored sandboxes must
+    /// start their counter here so hotplugged device IDs (blk<N>) don't collide with device
+    /// IDs already present in the restored VM state.
+    #[serde(default)]
+    pub id_generator: u32,
 }
 
 impl PooledTemplate {
@@ -121,6 +126,7 @@ impl PooledTemplate {
             original_task_vsock: original_task_vsock.into(),
             original_console_path: original_console_path.into(),
             ns_preinitialized: false,
+            id_generator: 0,
         }
     }
 }

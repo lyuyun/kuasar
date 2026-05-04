@@ -434,12 +434,19 @@ where
     ///
     /// `template_id` is persisted to sandbox.json for audit when the restore came from
     /// the template pool.  Pass `None` for a direct/one-off snapshot restore.
+    ///
+    /// `template_id_generator` must be set to the id_generator value of the sandbox that
+    /// produced the snapshot.  The restored VM already contains block devices with IDs up to
+    /// that value, so the new sandbox must start its counter there to avoid
+    /// `IdentifierNotUnique` errors when hotplugging further devices.  Pass `0` when
+    /// restoring from a snapshot taken from a bare (container-free) VM.
     pub async fn start_from_snapshot(
         &self,
         id: &str,
         snapshot_dir: &Path,
         template_id: Option<String>,
         ns_preinitialized: bool,
+        template_id_generator: u32,
     ) -> Result<()> {
         let sandbox_mutex = self
             .sandboxes
@@ -472,6 +479,10 @@ where
             sandbox.destroy_network().await;
             return Err(e);
         }
+
+        // Restore the id_generator from the template so that newly hotplugged device IDs
+        // do not collide with device IDs already present in the restored VM state.
+        sandbox.id_generator = template_id_generator;
 
         let sandbox_clone = sandbox_mutex.clone();
         monitor(sandbox_clone);
@@ -1721,7 +1732,7 @@ where
                     id, tmpl.id
                 );
                 match self
-                    .start_from_snapshot(id, &tmpl.snapshot_dir, Some(template_id.clone()), tmpl.ns_preinitialized)
+                    .start_from_snapshot(id, &tmpl.snapshot_dir, Some(template_id.clone()), tmpl.ns_preinitialized, tmpl.id_generator)
                     .await
                 {
                     Ok(()) => {

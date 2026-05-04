@@ -192,6 +192,10 @@ where
         .await
         .map_err(|e| anyhow!("create snapshot dir: {}", e))?;
 
+    // Capture id_generator before snapshot so restored sandboxes start their device ID
+    // counter above any IDs already embedded in the VM state (avoids IdentifierNotUnique).
+    let source_id_generator = sandbox.id_generator;
+
     // vm.snapshot() handles pause → snapshot → resume internally.
     let meta = sandbox
         .vm
@@ -217,6 +221,7 @@ where
     );
     // Snapshot was taken from a running sandbox — guest namespaces are already live.
     tmpl.ns_preinitialized = true;
+    tmpl.id_generator = source_id_generator;
 
     handle.pool.add(tmpl.clone()).await?;
     info!(
