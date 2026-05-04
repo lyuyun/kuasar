@@ -562,12 +562,19 @@ impl Snapshottable for CloudHypervisorVM {
         info!("restore {}: CH process ready in {}ms", self.id, t0.elapsed().as_millis());
 
         // 4. Trigger restore; CH loads config.json + state.json + memory-ranges from work_dir.
+        // CH restores vCPUs in a paused state (snapshot was taken while paused).
+        // Call vm.resume immediately after so the guest starts executing.
         let source_url = format!("file://{}", src.work_dir.display());
-        let client = self.get_client()?;
-        client
-            .vm_restore(&source_url, false)
-            .map_err(|e| anyhow!("vm.restore API: {}", e))?;
-        info!("restore {}: vm.restore API done in {}ms", self.id, t0.elapsed().as_millis());
+        {
+            let client = self.get_client()?;
+            client
+                .vm_restore(&source_url, false)
+                .map_err(|e| anyhow!("vm.restore API: {}", e))?;
+            client
+                .vm_resume()
+                .map_err(|e| anyhow!("vm.resume after restore: {}", e))?;
+        }
+        info!("restore {}: vm.restore+resume done in {}ms", self.id, t0.elapsed().as_millis());
 
         // 5. Wait for the guest agent to come back up over hvsock (15 s timeout).
         if let Err(e) = self.wait_agent_ready(15).await {
