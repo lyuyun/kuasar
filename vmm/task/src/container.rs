@@ -40,7 +40,7 @@ use containerd_shim::{
     util::read_spec,
     ExitSignal,
 };
-use log::debug;
+use log::{debug, warn};
 use nix::{sys::signalfd::signal::kill, unistd::Pid};
 use oci_spec::runtime::{LinuxResources, Process, Spec};
 use runc::{options::GlobalOpts, Runc, Spawner};
@@ -226,6 +226,8 @@ impl KuasarFactory {
             (None, Some(pio))
         };
 
+        diagnose_bundle(bundle, &id).await;
+
         let resp = init
             .lifecycle
             .runtime
@@ -235,12 +237,85 @@ impl KuasarFactory {
             if let Some(s) = socket {
                 s.clean().await;
             }
+            dump_runc_log(bundle).await;
             return Err(runtime_error(bundle, e, "OCI runtime create failed").await);
         }
         copy_io_or_console(init, socket, pio, init.lifecycle.exit_signal.clone()).await?;
         let pid = read_file_to_str(pid_path).await?.parse::<i32>()?;
         init.pid = pid;
         Ok(())
+    }
+}
+
+// Log key bundle state before calling runc so failures can be root-caused from logs alone.
+async fn diagnose_bundle(bundle: &str, id: &str) {
+    warn!("runc create: id={} bundle={}", id, bundle);
+
+    // config.json root path
+    let config_path = Path::new(bundle).join("config.json");
+    match tokio::fs::read_to_string(&config_path).await {
+        Err(e) => warn!("runc create: cannot read config.json: {}", e),
+        Ok(s) => {
+            // Extract root.path from the spec without pulling in the full oci_spec parse.
+            if let Some(rootfs) = extract_rootfs_path(&s) {
+                let exists = tokio::fs::metadata(&rootfs).await.is_ok();
+                warn!(
+                    "runc create: config.json root.path={} exists={}",
+                    rootfs, exists
+                );
+                if !exists {
+                    // List mounts to aid debugging.
+                    if let Ok(mounts) = tokio::fs::read_to_string("/proc/mounts").await {
+                        for line in mounts.lines() {
+                            if line.contains(&rootfs) {
+                                warn!("runc create: mount entry: {}", line);
+                            }
+                        }
+                    }
+                }
+            } else {
+                warn!("runc create: could not parse root.path from config.json");
+            }
+        }
+    }
+
+    // runc state directory
+    let runc_state = format!("/run/containerd/runc/default/{}", id);
+    let state_exists = tokio::fs::metadata(&runc_state).await.is_ok();
+    warn!(
+        "runc create: existing runc state at {} exists={}",
+        runc_state, state_exists
+    );
+}
+
+fn extract_rootfs_path(config_json: &str) -> Option<String> {
+    // Minimal extraction — avoid a full JSON parse just for one field.
+    // Looks for "root": { "path": "..." }
+    let idx = config_json.find("\"root\"")?;
+    let after = &config_json[idx..];
+    let path_idx = after.find("\"path\"")?;
+    let after = &after[path_idx + 6..]; // skip "path"
+    let colon = after.find(':')? + 1;
+    let after = after[colon..].trim_start();
+    if after.starts_with('"') {
+        let end = after[1..].find('"')?;
+        Some(after[1..end + 1].to_string())
+    } else {
+        None
+    }
+}
+
+// Dump the full runc log file on failure so every log level is visible.
+async fn dump_runc_log(bundle: &str) {
+    let log_path = Path::new(bundle).join("log.json");
+    match tokio::fs::read_to_string(&log_path).await {
+        Err(e) => warn!("runc log: cannot read log.json: {}", e),
+        Ok(s) if s.trim().is_empty() => warn!("runc log: log.json is empty"),
+        Ok(s) => {
+            for line in s.lines() {
+                warn!("runc log: {}", line);
+            }
+        }
     }
 }
 
@@ -255,7 +330,17 @@ pub async fn runtime_error(bundle: &str, r_err: runc::error::Error, msg: &str) -
         ),
         Ok(rt_msg) => {
             if rt_msg.is_empty() {
-                other!("{}: empty msg in log file: {}", msg, r_err)
+                // runc failed before writing to its log file; surface stderr if available.
+                let stderr = if let runc::error::Error::CommandFailed { stderr, .. } = &r_err {
+                    stderr.trim().to_string()
+                } else {
+                    String::new()
+                };
+                if stderr.is_empty() {
+                    other!("{}: empty msg in log file: {}", msg, r_err)
+                } else {
+                    other!("{}: {}", msg, stderr)
+                }
             } else {
                 other!("{}: {}", msg, rt_msg)
             }
@@ -654,11 +739,18 @@ impl Spawner for ShimExecutor {
                     monitor.wait(pid as i32)
                 ))
             } else {
-                Ok((
-                    "".to_string(),
-                    "".to_string(),
-                    monitor.wait(pid as i32).await,
-                ))
+                // Still capture stderr so runc failures that occur before the
+                // JSON log file is written (e.g. missing rootfs, bad config.json)
+                // surface in the CommandFailed error instead of being silently lost.
+                let stderr_stream = child
+                    .stderr
+                    .take()
+                    .map(ChildStderr::from_std)
+                    .transpose()
+                    .map_err(|e| runc::error::Error::Other(Box::new(e)))?;
+                let (stderr, exit_code) =
+                    tokio::join!(read_std(stderr_stream), monitor.wait(pid as i32));
+                Ok(("".to_string(), stderr, exit_code))
             }
         }
         .await;
