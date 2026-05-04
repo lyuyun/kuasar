@@ -204,7 +204,7 @@ where
         handle.factory.vcpus(),
         handle.factory.memory_mb(),
     );
-    let tmpl = PooledTemplate::new(
+    let mut tmpl = PooledTemplate::new(
         template_id,
         key,
         meta.snapshot_dir,
@@ -215,6 +215,8 @@ where
         meta.original_task_vsock,
         meta.original_console_path,
     );
+    // Snapshot was taken from a running sandbox — guest namespaces are already live.
+    tmpl.ns_preinitialized = true;
 
     handle.pool.add(tmpl.clone()).await?;
     info!(

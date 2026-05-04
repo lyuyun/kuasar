@@ -439,6 +439,7 @@ where
         id: &str,
         snapshot_dir: &Path,
         template_id: Option<String>,
+        ns_preinitialized: bool,
     ) -> Result<()> {
         let sandbox_mutex = self
             .sandboxes
@@ -464,6 +465,7 @@ where
                 task_vsock: format!("{}/task.vsock", sandbox.base_dir),
                 console_path: format!("/tmp/{}-task.log", sandbox.id),
             },
+            ns_preinitialized,
         };
 
         if let Err(e) = sandbox.start_from_snapshot(src).await {
@@ -635,11 +637,15 @@ where
             }
         }
 
-        if let Err(e) = self.setup_sandbox().await {
-            if let Err(re) = self.vm.stop(true).await {
-                warn!("sandbox {}: rollback setup_sandbox (restore): {}", self.id, re);
+        // Skip setup_sandbox if the guest was already fully initialized when the snapshot was
+        // taken (e.g. created via create_from_sandbox). Namespaces and sysctl are already live.
+        if !src.ns_preinitialized {
+            if let Err(e) = self.setup_sandbox().await {
+                if let Err(re) = self.vm.stop(true).await {
+                    warn!("sandbox {}: rollback setup_sandbox (restore): {}", self.id, re);
+                }
+                return Err(e);
             }
-            return Err(e);
         }
 
         self.forward_events().await;
@@ -1715,7 +1721,7 @@ where
                     id, tmpl.id
                 );
                 match self
-                    .start_from_snapshot(id, &tmpl.snapshot_dir, Some(template_id.clone()))
+                    .start_from_snapshot(id, &tmpl.snapshot_dir, Some(template_id.clone()), tmpl.ns_preinitialized)
                     .await
                 {
                     Ok(()) => {

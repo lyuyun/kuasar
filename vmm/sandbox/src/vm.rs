@@ -129,6 +129,9 @@ pub struct RestoreSource {
     pub snapshot_dir: PathBuf,
     pub work_dir: PathBuf,
     pub overrides: SnapshotPathOverrides,
+    /// Skip the setup_sandbox RPC on restore — the guest was already fully initialized when
+    /// the snapshot was taken (e.g. snapshot from a running sandbox, not a bare boot image).
+    pub ns_preinitialized: bool,
 }
 
 #[derive(Debug, Default)]

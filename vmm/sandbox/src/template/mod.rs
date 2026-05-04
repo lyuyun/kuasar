@@ -68,6 +68,10 @@ pub struct PooledTemplate {
     pub original_task_vsock: String,
     /// Original console log path recorded at snapshot time.
     pub original_console_path: String,
+    /// True when the snapshot was taken from a fully-initialized sandbox (setup_sandbox already
+    /// called inside the guest). On restore we skip the setup_sandbox RPC in this case.
+    #[serde(default)]
+    pub ns_preinitialized: bool,
 }
 
 impl PooledTemplate {
@@ -116,6 +120,7 @@ impl PooledTemplate {
             created_at_secs: Self::now_secs(),
             original_task_vsock: original_task_vsock.into(),
             original_console_path: original_console_path.into(),
+            ns_preinitialized: false,
         }
     }
 }
