@@ -24,9 +24,8 @@ use anyhow::anyhow;
 use api_client::{simple_api_command, simple_api_full_command_with_fds_and_response};
 use containerd_sandbox::error::Result;
 use log::{debug, error, trace};
-use tokio::task::spawn_blocking;
-
 use serde_json::json;
+use tokio::task::spawn_blocking;
 
 use crate::{
     cloud_hypervisor::devices::{block::DiskConfig, AddDeviceResponse, RemoveDeviceRequest},

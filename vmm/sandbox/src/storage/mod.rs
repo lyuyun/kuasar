@@ -14,7 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{collections::HashMap, io::ErrorKind, os::unix::fs::PermissionsExt, path::Path, time::Duration};
+use std::{
+    collections::HashMap, io::ErrorKind, os::unix::fs::PermissionsExt, path::Path, time::Duration,
+};
 
 use anyhow::anyhow;
 use containerd_sandbox::{
@@ -24,8 +26,8 @@ use containerd_sandbox::{
 use containerd_shim::mount::mount_rootfs;
 use log::{debug, warn};
 use nix::libc::MNT_DETACH;
-pub use utils::*;
 use ttrpc::context::with_timeout;
+pub use utils::*;
 use vmm_common::{
     api::sandbox::ExecVMProcessRequest,
     mount::{bind_mount, unmount, MNT_NOFOLLOW},
@@ -497,7 +499,8 @@ where
                 .await
                 .map_err(|e| anyhow!("read {}: {}", source, e))?;
             let dest_in_guest = format!("{}/{}", KUASAR_STATE_DIR, storage_id);
-            self.push_file_to_guest(&dest_in_guest, content, mode).await?;
+            self.push_file_to_guest(&dest_in_guest, content, mode)
+                .await?;
 
             let options = if read_only {
                 vec!["ro".to_string()]
@@ -670,12 +673,7 @@ where
 
     // Push a single file to the guest at dest_path, preserving the given permissions.
     // Paths are shell-quoted so they are safe even if they contain spaces or special characters.
-    async fn push_file_to_guest(
-        &self,
-        dest_path: &str,
-        content: Vec<u8>,
-        mode: u32,
-    ) -> Result<()> {
+    async fn push_file_to_guest(&self, dest_path: &str, content: Vec<u8>, mode: u32) -> Result<()> {
         let client_guard = self.client.lock().await;
         if let Some(client) = client_guard.as_ref() {
             let timeout_ns = Duration::from_secs(10).as_nanos() as i64;
@@ -861,13 +859,11 @@ mod tests {
     use async_trait::async_trait;
     use containerd_sandbox::{error::Result, spec::Mount};
     use serde::{Deserialize, Serialize};
+    use temp_dir::TempDir;
     use vmm_common::storage::Storage;
 
-    use crate::{device::DeviceInfo, sandbox::KuasarSandbox, vm::VM};
-
-    use temp_dir::TempDir;
-
     use super::{count_dir_contents, shell_quote, validate_guest_path};
+    use crate::{device::DeviceInfo, sandbox::KuasarSandbox, vm::VM};
 
     #[derive(Serialize, Deserialize)]
     struct MockVM;
@@ -1017,7 +1013,10 @@ mod tests {
 
     #[test]
     fn test_shell_quote() {
-        assert_eq!(shell_quote("/run/kuasar/state/storage1"), "'/run/kuasar/state/storage1'");
+        assert_eq!(
+            shell_quote("/run/kuasar/state/storage1"),
+            "'/run/kuasar/state/storage1'"
+        );
         assert_eq!(shell_quote("/tmp/file name.txt"), "'/tmp/file name.txt'");
         assert_eq!(shell_quote("/tmp/a'b"), "'/tmp/a'\\''b'");
         assert_eq!(shell_quote("/tmp/$HOME"), "'/tmp/$HOME'");
@@ -1036,8 +1035,12 @@ mod tests {
     #[tokio::test]
     async fn test_count_dir_contents_with_files() {
         let dir = TempDir::new().unwrap();
-        tokio::fs::write(dir.path().join("a.txt"), b"hello").await.unwrap();
-        tokio::fs::write(dir.path().join("b.txt"), b"world!").await.unwrap();
+        tokio::fs::write(dir.path().join("a.txt"), b"hello")
+            .await
+            .unwrap();
+        tokio::fs::write(dir.path().join("b.txt"), b"world!")
+            .await
+            .unwrap();
         let sub = dir.path().join("sub");
         tokio::fs::create_dir(&sub).await.unwrap();
         tokio::fs::write(sub.join("c.txt"), b"123").await.unwrap();

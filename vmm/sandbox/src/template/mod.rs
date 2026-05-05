@@ -222,9 +222,7 @@ impl TemplatePool {
             match PooledTemplate::load(&dir).await {
                 Ok(tmpl) => {
                     let mut map = pool.available.lock().await;
-                    map.entry(tmpl.key.clone())
-                        .or_default()
-                        .push_back(tmpl);
+                    map.entry(tmpl.key.clone()).or_default().push_back(tmpl);
                 }
                 Err(e) => {
                     log::warn!(
@@ -299,12 +297,7 @@ impl TemplatePool {
 
     /// Total number of available templates across all keys.
     pub async fn total_depth(&self) -> usize {
-        self.available
-            .lock()
-            .await
-            .values()
-            .map(|q| q.len())
-            .sum()
+        self.available.lock().await.values().map(|q| q.len()).sum()
     }
 
     /// Number of distinct keys that have at least one available template.
@@ -332,8 +325,9 @@ impl CreateTemplateRequest {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use temp_dir::TempDir;
+
+    use super::*;
 
     fn make_key() -> TemplateKey {
         TemplateKey::new("/var/lib/kuasar/rootfs.img", 2, 512)

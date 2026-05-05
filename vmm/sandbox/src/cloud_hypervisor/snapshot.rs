@@ -44,8 +44,7 @@ impl TemplateMeta {
         let content = tokio::fs::read_to_string(dir.join("metadata.json"))
             .await
             .map_err(|e| anyhow!("read metadata.json from {}: {}", dir.display(), e))?;
-        serde_json::from_str(&content)
-            .map_err(|e| anyhow!("parse metadata.json: {}", e).into())
+        serde_json::from_str(&content).map_err(|e| anyhow!("parse metadata.json: {}", e).into())
     }
 }
 
@@ -71,8 +70,7 @@ pub async fn patch_snapshot_config(
         Some(v) => *v = serde_json::Value::String(overrides.task_vsock.clone()),
         None => {
             return Err(
-                anyhow!("config.json missing /vsock/socket — unexpected CH config format")
-                    .into(),
+                anyhow!("config.json missing /vsock/socket — unexpected CH config format").into(),
             )
         }
     }
@@ -97,9 +95,11 @@ pub async fn patch_snapshot_config(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::path::PathBuf;
+
     use temp_dir::TempDir;
+
+    use super::*;
 
     #[tokio::test]
     async fn test_patch_snapshot_config() {
@@ -144,19 +144,10 @@ mod tests {
         let patched: serde_json::Value =
             serde_json::from_str(&tokio::fs::read_to_string(&dst).await.unwrap()).unwrap();
 
-        assert_eq!(
-            patched["vsock"]["socket"],
-            "/new/sandbox-xyz/task.vsock"
-        );
-        assert_eq!(
-            patched["console"]["file"],
-            "/tmp/sandbox-xyz-task.log"
-        );
+        assert_eq!(patched["vsock"]["socket"], "/new/sandbox-xyz/task.vsock");
+        assert_eq!(patched["console"]["file"], "/tmp/sandbox-xyz-task.log");
         // pmem path must remain unchanged
-        assert_eq!(
-            patched["pmem"][0]["file"],
-            "/var/lib/kuasar/rootfs.img"
-        );
+        assert_eq!(patched["pmem"][0]["file"], "/var/lib/kuasar/rootfs.img");
         // container blk devices must be stripped — they will be re-hot-plugged after restore
         assert_eq!(patched["disks"], serde_json::json!([]));
     }

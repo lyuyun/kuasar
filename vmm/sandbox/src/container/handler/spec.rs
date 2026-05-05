@@ -26,9 +26,8 @@ use log::debug;
 use path_clean::clean;
 use ttrpc::context::with_timeout;
 use vmm_common::{
-    api::sandbox::ExecVMProcessRequest,
-    ETC_HOSTNAME, ETC_HOSTS, ETC_RESOLV, HOSTNAME_FILENAME, HOSTS_FILENAME, KUASAR_STATE_DIR,
-    RESOLV_FILENAME,
+    api::sandbox::ExecVMProcessRequest, ETC_HOSTNAME, ETC_HOSTS, ETC_RESOLV, HOSTNAME_FILENAME,
+    HOSTS_FILENAME, KUASAR_STATE_DIR, RESOLV_FILENAME,
 };
 
 use crate::{
@@ -103,8 +102,7 @@ where
             let client_guard = sandbox.client.lock().await;
             if let Some(client) = client_guard.as_ref() {
                 let timeout_ns = Duration::from_secs(10).as_nanos() as i64;
-                let bundle_guest =
-                    format!("{}/{}", KUASAR_STATE_DIR, self.container_id);
+                let bundle_guest = format!("{}/{}", KUASAR_STATE_DIR, self.container_id);
 
                 let mut mkdir_req = ExecVMProcessRequest::new();
                 mkdir_req.command = format!("mkdir -p {}", bundle_guest);

@@ -37,10 +37,10 @@ use containerd_shim::{
     protos::api::Envelope,
     util::write_str_to_file,
 };
+use lazy_static::lazy_static;
 use log::{debug, error, info, warn};
 use protobuf::{well_known_types::any::Any, MessageField};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use lazy_static::lazy_static;
 use tokio::{
     fs::{copy, create_dir_all, remove_dir_all, OpenOptions},
     io::{AsyncReadExt, AsyncWriteExt},
@@ -76,7 +76,7 @@ use crate::{
     template::{CreateTemplateRequest, PooledTemplate, TemplateKey, TemplateMetrics, TemplatePool},
     utils::{get_dns_config, get_hostname, get_resources, get_sandbox_cgroup_parent_path},
     vm::{
-        Hooks, Recoverable, RestoreSource, SnapshotMeta, Snapshottable, SnapshotPathOverrides,
+        Hooks, Recoverable, RestoreSource, SnapshotMeta, SnapshotPathOverrides, Snapshottable,
         VMFactory, VM,
     },
 };
@@ -631,7 +631,10 @@ where
 
         if let Err(e) = self.init_client().await {
             if let Err(re) = self.vm.stop(true).await {
-                warn!("sandbox {}: rollback init_client (restore): {}", self.id, re);
+                warn!(
+                    "sandbox {}: rollback init_client (restore): {}",
+                    self.id, re
+                );
             }
             return Err(e);
         }
@@ -653,7 +656,10 @@ where
         if !src.ns_preinitialized {
             if let Err(e) = self.setup_sandbox().await {
                 if let Err(re) = self.vm.stop(true).await {
-                    warn!("sandbox {}: rollback setup_sandbox (restore): {}", self.id, re);
+                    warn!(
+                        "sandbox {}: rollback setup_sandbox (restore): {}",
+                        self.id, re
+                    );
                 }
                 return Err(e);
             }
@@ -1663,11 +1669,13 @@ where
     ///
     /// Returns `None` when the template pool has not been initialized.
     pub fn admin_handle(&self) -> Option<crate::admin::TemplateAdminHandle<F>> {
-        self.template_pool.as_ref().map(|pool| crate::admin::TemplateAdminHandle {
-            factory: self.factory.clone(),
-            sandboxes: self.sandboxes.clone(),
-            pool: pool.clone(),
-        })
+        self.template_pool
+            .as_ref()
+            .map(|pool| crate::admin::TemplateAdminHandle {
+                factory: self.factory.clone(),
+                sandboxes: self.sandboxes.clone(),
+                pool: pool.clone(),
+            })
     }
 
     /// Boot a fresh VM, snapshot it once the guest agent is ready, stop it, and
@@ -1732,7 +1740,13 @@ where
                     id, tmpl.id
                 );
                 match self
-                    .start_from_snapshot(id, &tmpl.snapshot_dir, Some(template_id.clone()), tmpl.ns_preinitialized, tmpl.id_generator)
+                    .start_from_snapshot(
+                        id,
+                        &tmpl.snapshot_dir,
+                        Some(template_id.clone()),
+                        tmpl.ns_preinitialized,
+                        tmpl.id_generator,
+                    )
                     .await
                 {
                     Ok(()) => {
@@ -1837,7 +1851,6 @@ where
         Ok(())
     }
 }
-
 
 #[cfg(test)]
 mod tests {

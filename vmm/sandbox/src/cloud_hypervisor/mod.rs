@@ -14,7 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{os::fd::OwnedFd, process::Stdio, time::{Duration, Instant}};
+use std::{
+    os::fd::OwnedFd,
+    process::Stdio,
+    time::{Duration, Instant},
+};
 
 use anyhow::anyhow;
 use async_trait::async_trait;
@@ -30,10 +34,11 @@ use tokio::{
     task::JoinHandle,
 };
 use tracing::instrument;
-use vmm_common::SHARED_DIR_SUFFIX;
-
 use ttrpc::context::with_timeout;
-use vmm_common::api::sandbox::{CheckRequest, ExecVMProcessRequest};
+use vmm_common::{
+    api::sandbox::{CheckRequest, ExecVMProcessRequest},
+    SHARED_DIR_SUFFIX,
+};
 
 use crate::{
     client::{new_sandbox_client, new_sandbox_client_fail_fast},
@@ -326,10 +331,7 @@ impl VM for CloudHypervisorVM {
             .map_err(|e| anyhow!("ping: connect to agent socket: {}", e))?;
         let req = CheckRequest::new();
         client
-            .check(
-                with_timeout(Duration::from_secs(3).as_nanos() as i64),
-                &req,
-            )
+            .check(with_timeout(Duration::from_secs(3).as_nanos() as i64), &req)
             .await
             .map_err(|e| anyhow!("ping: agent check RPC: {}", e))?;
         Ok(())
@@ -383,9 +385,8 @@ impl crate::vm::Recoverable for CloudHypervisorVM {
     async fn recover(&mut self) -> Result<()> {
         let pid = self.pid()?;
         // Fast-fail: if the process is gone, skip the 10-s socket connect timeout.
-        signal::kill(Pid::from_raw(pid as i32), None).map_err(|_| {
-            anyhow!("vm process {} is no longer running", pid)
-        })?;
+        signal::kill(Pid::from_raw(pid as i32), None)
+            .map_err(|_| anyhow!("vm process {} is no longer running", pid))?;
         if !std::path::Path::new(&self.config.api_socket).exists() {
             return Err(anyhow!(
                 "api socket {} does not exist, vm process may have died",
@@ -503,9 +504,15 @@ impl Snapshottable for CloudHypervisorVM {
 
         // Flush guest ext4 journals so snapshot captures fully-committed state.
         if let Err(e) = self.sync_guest_fs().await {
-            warn!("guest sync before snapshot failed, snapshot may be inconsistent: {}", e);
+            warn!(
+                "guest sync before snapshot failed, snapshot may be inconsistent: {}",
+                e
+            );
         }
-        info!("snapshot {id}: guest sync done in {}ms", t0.elapsed().as_millis());
+        info!(
+            "snapshot {id}: guest sync done in {}ms",
+            t0.elapsed().as_millis()
+        );
 
         let client = self.get_client()?;
 
@@ -520,7 +527,10 @@ impl Snapshottable for CloudHypervisorVM {
         if let Err(e) = client.vm_resume() {
             error!("vm.resume after snapshot failed: {}", e);
         }
-        info!("snapshot {id}: vm.snapshot + resume done in {}ms", t0.elapsed().as_millis());
+        info!(
+            "snapshot {id}: vm.snapshot + resume done in {}ms",
+            t0.elapsed().as_millis()
+        );
 
         snap_result.map_err(|e| anyhow!("vm.snapshot: {}", e))?;
 
@@ -559,7 +569,11 @@ impl Snapshottable for CloudHypervisorVM {
 
         // 3. Start CH with only --api-socket; all VM config comes from the snapshot.
         self.launch_for_restore().await?;
-        info!("restore {}: CH process ready in {}ms", self.id, t0.elapsed().as_millis());
+        info!(
+            "restore {}: CH process ready in {}ms",
+            self.id,
+            t0.elapsed().as_millis()
+        );
 
         // 4. Trigger restore; CH loads config.json + state.json + memory-ranges from work_dir.
         // CH restores vCPUs in a paused state (snapshot was taken while paused).
@@ -574,7 +588,11 @@ impl Snapshottable for CloudHypervisorVM {
                 .vm_resume()
                 .map_err(|e| anyhow!("vm.resume after restore: {}", e))?;
         }
-        info!("restore {}: vm.restore+resume done in {}ms", self.id, t0.elapsed().as_millis());
+        info!(
+            "restore {}: vm.restore+resume done in {}ms",
+            self.id,
+            t0.elapsed().as_millis()
+        );
 
         // 5. Wait for the guest agent to come back up over hvsock (15 s timeout).
         if let Err(e) = self.wait_agent_ready(15).await {
@@ -627,7 +645,10 @@ mod snapshot_tests {
         let result = vm.wait_agent_ready(1).await;
         assert!(result.is_err(), "expected timeout error");
         let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("timeout"), "expected 'timeout' in error, got: {msg}");
+        assert!(
+            msg.contains("timeout"),
+            "expected 'timeout' in error, got: {msg}"
+        );
     }
 
     /// End-to-end snapshot → restore roundtrip.
@@ -639,12 +660,15 @@ mod snapshot_tests {
     #[tokio::test]
     #[ignore = "requires host CH binary, kernel, and rootfs; set CH_BINARY/CH_KERNEL/CH_ROOTFS"]
     async fn snapshot_restore_roundtrip() {
-        use crate::cloud_hypervisor::{
-            config::CloudHypervisorVMConfig,
-            devices::{console::Console, pmem::Pmem, vsock::Vsock},
-        };
-        use crate::vm::{RestoreSource, SnapshotPathOverrides, Snapshottable, VM};
         use temp_dir::TempDir;
+
+        use crate::{
+            cloud_hypervisor::{
+                config::CloudHypervisorVMConfig,
+                devices::{console::Console, pmem::Pmem, vsock::Vsock},
+            },
+            vm::{RestoreSource, SnapshotPathOverrides, Snapshottable, VM},
+        };
 
         let ch_binary = std::env::var("CH_BINARY")
             .unwrap_or_else(|_| "/usr/local/bin/cloud-hypervisor".to_string());
@@ -671,7 +695,8 @@ mod snapshot_tests {
         vm_config.common.kernel_path = kernel.clone();
         vm_config.common.image_path = rootfs.clone();
 
-        let mut tmpl_vm = CloudHypervisorVM::new("tmpl", "", tmpl_dir.to_str().unwrap(), &vm_config);
+        let mut tmpl_vm =
+            CloudHypervisorVM::new("tmpl", "", tmpl_dir.to_str().unwrap(), &vm_config);
         tmpl_vm.add_device(Pmem::new("rootfs", &rootfs, true));
         let tmpl_vsock = format!("{}/task.vsock", tmpl_dir.display());
         tmpl_vm.add_device(Vsock::new(3, &tmpl_vsock, "vsock"));
@@ -679,7 +704,10 @@ mod snapshot_tests {
         tmpl_vm.add_device(Console::new("/tmp/tmpl-task.log", "console"));
 
         let t_cold = Instant::now();
-        tmpl_vm.start().await.expect("template VM cold start failed");
+        tmpl_vm
+            .start()
+            .await
+            .expect("template VM cold start failed");
         eprintln!("cold start: {}ms", t_cold.elapsed().as_millis());
 
         // snapshot

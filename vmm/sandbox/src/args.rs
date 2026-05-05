@@ -51,7 +51,11 @@ pub struct Args {
     pub log_level: Option<String>,
 
     /// Unix socket path for the admin API (template management via kuasar-ctl)
-    #[arg(long, value_name = "FILE", default_value = "/run/kuasar-vmm-admin.sock")]
+    #[arg(
+        long,
+        value_name = "FILE",
+        default_value = "/run/kuasar-vmm-admin.sock"
+    )]
     pub admin: String,
 }
 

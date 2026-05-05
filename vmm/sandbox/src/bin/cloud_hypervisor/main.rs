@@ -58,10 +58,7 @@ async fn main() {
 
     if let Some(pool_cfg) = template_pool_cfg {
         sandboxer
-            .init_template_pool(
-                pool_cfg.store_dir,
-                pool_cfg.max_per_key.unwrap_or(10),
-            )
+            .init_template_pool(pool_cfg.store_dir, pool_cfg.max_per_key.unwrap_or(10))
             .await
             .unwrap_or_else(|e| log::error!("failed to init template pool: {}", e));
     }

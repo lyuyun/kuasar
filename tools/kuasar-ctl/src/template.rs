@@ -48,10 +48,7 @@ async fn call_admin(admin_sock: &Path, request: Value) -> Result<Value> {
 
 fn check_response(resp: Value) -> Result<String> {
     if resp["ok"].as_bool().unwrap_or(false) {
-        Ok(resp["template_id"]
-            .as_str()
-            .unwrap_or("")
-            .to_string())
+        Ok(resp["template_id"].as_str().unwrap_or("").to_string())
     } else {
         Err(anyhow!(
             "sandboxer error: {}",
