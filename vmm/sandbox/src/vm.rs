@@ -129,6 +129,27 @@ pub struct SnapshotPathOverrides {
     pub console_path: String,
 }
 
+/// One ext4 block device to capture during a full-checkpoint snapshot.
+/// Passed by the caller (which has access to sandbox storages) to `Snapshottable::snapshot`.
+pub struct DiskSnapshot {
+    /// Storage ID, used to derive the `.img` filename on the host.
+    pub storage_id: String,
+    /// CH device ID matching the `id` field in `config.json`'s `disks` array.
+    pub device_id: String,
+    /// Absolute path to the `.img` backing file on the host.
+    pub img_path: String,
+}
+
+/// Describes a disk image stored inside a snapshot directory, used both in
+/// `SnapshotMeta` (what was captured) and `RestoreSource` (what to restore).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct DiskImageEntry {
+    pub storage_id: String,
+    pub device_id: String,
+    /// Path relative to the snapshot directory, e.g. `"disks/storage3.img"`.
+    pub filename: String,
+}
+
 pub struct RestoreSource {
     pub snapshot_dir: PathBuf,
     pub work_dir: PathBuf,
@@ -136,6 +157,10 @@ pub struct RestoreSource {
     /// Skip the setup_sandbox RPC on restore — the guest was already fully initialized when
     /// the snapshot was taken (e.g. snapshot from a running sandbox, not a bare boot image).
     pub ns_preinitialized: bool,
+    /// Disk images to restore into the new sandbox directory.
+    /// Empty = template mode (disks stripped from config.json).
+    /// Non-empty = full-checkpoint mode (disk files copied and paths remapped).
+    pub disk_images: Vec<DiskImageEntry>,
 }
 
 #[derive(Debug, Default)]
@@ -143,12 +168,17 @@ pub struct SnapshotMeta {
     pub snapshot_dir: PathBuf,
     pub original_task_vsock: String,
     pub original_console_path: String,
+    /// Disk images captured in this snapshot.
+    /// Empty for bare-VM template snapshots; non-empty for full-checkpoint snapshots.
+    pub disk_images: Vec<DiskImageEntry>,
 }
 
 #[async_trait]
 pub trait Snapshottable {
-    async fn snapshot(&mut self, dest_dir: &Path) -> Result<SnapshotMeta> {
-        let _ = dest_dir;
+    /// Capture VM state to `dest_dir`.  `disks` lists host-side ext4 images to copy
+    /// while the VM is paused; pass an empty slice for bare-VM (template) snapshots.
+    async fn snapshot(&mut self, dest_dir: &Path, disks: &[DiskSnapshot]) -> Result<SnapshotMeta> {
+        let _ = (dest_dir, disks);
         Err(anyhow!("snapshot not supported for this VM type").into())
     }
     async fn restore(&mut self, src: &RestoreSource) -> Result<()> {

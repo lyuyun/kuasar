@@ -41,7 +41,7 @@ use tokio::{
 use crate::{
     sandbox::{create_template_from_image_worker, create_template_worker, KuasarSandbox},
     template::{CreateTemplateRequest, PooledTemplate, TemplateKey, TemplatePool},
-    vm::{Snapshottable, VMFactory, VM},
+    vm::{DiskSnapshot, Snapshottable, VMFactory, VM},
 };
 
 /// Shared state extracted from `KuasarSandboxer` for the admin server.
@@ -196,10 +196,25 @@ where
     // counter above any IDs already embedded in the VM state (avoids IdentifierNotUnique).
     let source_id_generator = sandbox.id_generator;
 
-    // vm.snapshot() handles pause → snapshot → resume internally.
+    // Collect ext4 disk images that are hot-attached as virtio-blk devices.
+    // These are copied into the snapshot directory while the VM is paused (inside snapshot()).
+    let disks: Vec<DiskSnapshot> = sandbox
+        .storages
+        .iter()
+        .filter(|s| s.fstype == "ext4")
+        .filter_map(|s| {
+            s.device_id.as_ref().map(|did| DiskSnapshot {
+                storage_id: s.id.clone(),
+                device_id: did.clone(),
+                img_path: format!("{}/{}.img", sandbox.base_dir, s.id),
+            })
+        })
+        .collect();
+
+    // vm.snapshot() handles pause → disk copy → CH snapshot → resume internally.
     let meta = sandbox
         .vm
-        .snapshot(&snapshot_dir)
+        .snapshot(&snapshot_dir, &disks)
         .await
         .map_err(|e| anyhow!("snapshot sandbox {}: {}", sandbox_id, e))?;
 
@@ -222,6 +237,7 @@ where
     // Snapshot was taken from a running sandbox — guest namespaces are already live.
     tmpl.ns_preinitialized = true;
     tmpl.id_generator = source_id_generator;
+    tmpl.disk_images = meta.disk_images;
 
     handle.pool.add(tmpl.clone()).await?;
     info!(

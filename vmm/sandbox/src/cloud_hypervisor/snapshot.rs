@@ -53,10 +53,18 @@ impl TemplateMeta {
 /// CH's config.json records absolute paths for the vsock and console devices, which are unique
 /// per-sandbox.  During restore these must point to the *new* sandbox's paths, not the template's.
 /// pmem (rootfs) paths are deliberately left unchanged — they are shared read-only.
+///
+/// `disk_remaps` controls how hot-plugged disk entries are handled:
+/// - Empty (template mode): all disk entries are stripped.  Containers will re-hot-plug their
+///   own `.img` files after the VM starts.
+/// - Non-empty (full-checkpoint mode): each `(device_id, new_path)` pair remaps the `path`
+///   field of the matching disk entry to point to the restored copy in the new sandbox dir.
+///   Disk entries whose `id` is not in the remap list are stripped (conservative).
 pub async fn patch_snapshot_config(
     src: &Path,
     dst: &Path,
     overrides: &SnapshotPathOverrides,
+    disk_remaps: &[(String, String)],
 ) -> Result<()> {
     let content = tokio::fs::read_to_string(src)
         .await
@@ -80,12 +88,30 @@ pub async fn patch_snapshot_config(
         *v = serde_json::Value::String(overrides.console_path.clone());
     }
 
-    // Strip hot-plugged container blk devices from the restore config.
-    // These paths (e.g. {sandbox_dir}/{storage_id}.img) are per-sandbox and do not
-    // exist in the new sandbox's directory. Containers re-attach their blk devices
-    // via hot-plug after the VM is restored, so clearing this array is safe.
-    if let Some(disks) = cfg.get_mut("disks") {
-        *disks = serde_json::Value::Array(vec![]);
+    if disk_remaps.is_empty() {
+        // Template mode: strip all hot-plugged container blk devices.
+        // Containers re-attach their own `.img` files via hot-plug after the VM starts.
+        if let Some(disks) = cfg.get_mut("disks") {
+            *disks = serde_json::Value::Array(vec![]);
+        }
+    } else {
+        // Full-checkpoint mode: remap each disk's path to the restored copy in the new sandbox
+        // dir.  Disk entries whose id is absent from disk_remaps are stripped (conservative).
+        if let Some(arr) = cfg.get_mut("disks").and_then(|d| d.as_array_mut()) {
+            arr.retain_mut(|disk| {
+                let id = match disk.get("id").and_then(|v| v.as_str()) {
+                    Some(s) => s.to_string(),
+                    None => return false,
+                };
+                match disk_remaps.iter().find(|(did, _)| *did == id) {
+                    Some((_, new_path)) => {
+                        disk["path"] = serde_json::Value::String(new_path.clone());
+                        true
+                    }
+                    None => false,
+                }
+            });
+        }
     }
 
     let serialized = serde_json::to_string_pretty(&cfg)
@@ -139,7 +165,10 @@ mod tests {
             task_vsock: "/new/sandbox-xyz/task.vsock".to_string(),
             console_path: "/tmp/sandbox-xyz-task.log".to_string(),
         };
-        patch_snapshot_config(&src, &dst, &overrides).await.unwrap();
+        // Template mode: empty disk_remaps → disks stripped
+        patch_snapshot_config(&src, &dst, &overrides, &[])
+            .await
+            .unwrap();
 
         let patched: serde_json::Value =
             serde_json::from_str(&tokio::fs::read_to_string(&dst).await.unwrap()).unwrap();
@@ -148,8 +177,50 @@ mod tests {
         assert_eq!(patched["console"]["file"], "/tmp/sandbox-xyz-task.log");
         // pmem path must remain unchanged
         assert_eq!(patched["pmem"][0]["file"], "/var/lib/kuasar/rootfs.img");
-        // container blk devices must be stripped — they will be re-hot-plugged after restore
+        // template mode: container blk devices stripped (re-hot-plugged after restore)
         assert_eq!(patched["disks"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn test_patch_snapshot_config_disk_remap() {
+        let dir = TempDir::new().unwrap();
+        let src = dir.path().join("config.json");
+        let dst = dir.path().join("config_patched.json");
+
+        let original = serde_json::json!({
+            "vsock": {"socket": "/old/task.vsock", "cid": 3},
+            "console": {"file": "/tmp/old.log", "mode": "File"},
+            "pmem": [{"file": "/var/lib/kuasar/rootfs.img", "discard_writes": true}],
+            "disks": [
+                {"path": "/old/storage3.img", "readonly": false, "id": "blk3"},
+                {"path": "/old/storage4.img", "readonly": false, "id": "blk4"}
+            ]
+        });
+        tokio::fs::write(&src, serde_json::to_string_pretty(&original).unwrap())
+            .await
+            .unwrap();
+
+        let overrides = SnapshotPathOverrides {
+            task_vsock: "/new/task.vsock".to_string(),
+            console_path: "/tmp/new.log".to_string(),
+        };
+        // Full-checkpoint mode: remap blk3, strip blk4 (not in remaps)
+        let remaps = vec![("blk3".to_string(), "/new/sandbox/storage3.img".to_string())];
+        patch_snapshot_config(&src, &dst, &overrides, &remaps)
+            .await
+            .unwrap();
+
+        let patched: serde_json::Value =
+            serde_json::from_str(&tokio::fs::read_to_string(&dst).await.unwrap()).unwrap();
+
+        assert_eq!(patched["vsock"]["socket"], "/new/task.vsock");
+        // blk3 remapped to new path
+        let disks = patched["disks"].as_array().unwrap();
+        assert_eq!(disks.len(), 1);
+        assert_eq!(disks[0]["id"], "blk3");
+        assert_eq!(disks[0]["path"], "/new/sandbox/storage3.img");
+        // pmem unchanged
+        assert_eq!(patched["pmem"][0]["file"], "/var/lib/kuasar/rootfs.img");
     }
 
     #[tokio::test]
@@ -195,7 +266,7 @@ mod tests {
             task_vsock: "/new/task.vsock".to_string(),
             console_path: "/tmp/console.log".to_string(),
         };
-        let result = patch_snapshot_config(&src, &dst, &overrides).await;
+        let result = patch_snapshot_config(&src, &dst, &overrides, &[]).await;
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(msg.contains("missing /vsock/socket"), "got: {}", msg);

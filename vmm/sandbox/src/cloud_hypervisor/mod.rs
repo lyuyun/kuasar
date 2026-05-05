@@ -53,7 +53,10 @@ use crate::{
     device::{BusType, DeviceInfo},
     param::ToCmdLineParams,
     utils::{read_std, set_cmd_fd, set_cmd_netns, wait_channel, wait_pid, write_file_atomic},
-    vm::{Pids, RestoreSource, SnapshotMeta, Snapshottable, VcpuThreads, VM},
+    vm::{
+        DiskImageEntry, DiskSnapshot, Pids, RestoreSource, SnapshotMeta, Snapshottable,
+        VcpuThreads, VM,
+    },
 };
 
 mod client;
@@ -497,7 +500,11 @@ impl CloudHypervisorVM {
 
 #[async_trait]
 impl Snapshottable for CloudHypervisorVM {
-    async fn snapshot(&mut self, dest_dir: &std::path::Path) -> Result<SnapshotMeta> {
+    async fn snapshot(
+        &mut self,
+        dest_dir: &std::path::Path,
+        disks: &[DiskSnapshot],
+    ) -> Result<SnapshotMeta> {
         let t0 = Instant::now();
         let id = self.id.clone();
         tokio::fs::create_dir_all(dest_dir).await?;
@@ -520,6 +527,31 @@ impl Snapshottable for CloudHypervisorVM {
         client.vm_pause().map_err(|e| anyhow!("vm.pause: {}", e))?;
         info!("snapshot {id}: vm paused in {}ms", t0.elapsed().as_millis());
 
+        // Copy disk images while the VM is paused: guest journals are already flushed,
+        // device I/O queues are frozen, so the .img file is at a consistent checkpoint.
+        let disk_images = if !disks.is_empty() {
+            let disks_dir = dest_dir.join("disks");
+            match copy_disk_images(disks, dest_dir, &disks_dir).await {
+                Ok(entries) => {
+                    info!(
+                        "snapshot {id}: {} disk image(s) copied in {}ms",
+                        entries.len(),
+                        t0.elapsed().as_millis()
+                    );
+                    entries
+                }
+                Err(e) => {
+                    // Resume before propagating the error so the VM doesn't stay paused.
+                    if let Err(re) = client.vm_resume() {
+                        error!("vm.resume after disk-copy failure: {}", re);
+                    }
+                    return Err(anyhow!("snapshot {id}: disk copy failed: {}", e).into());
+                }
+            }
+        } else {
+            vec![]
+        };
+
         let dest_url = format!("file://{}", dest_dir.display());
         let snap_result = client.vm_snapshot(&dest_url);
 
@@ -538,6 +570,7 @@ impl Snapshottable for CloudHypervisorVM {
             snapshot_dir: dest_dir.to_path_buf(),
             original_task_vsock: self.vsock_path(),
             original_console_path: self.console_log_path(),
+            disk_images,
         })
     }
 
@@ -545,11 +578,42 @@ impl Snapshottable for CloudHypervisorVM {
         let t0 = Instant::now();
         tokio::fs::create_dir_all(&src.work_dir).await?;
 
-        // 1. Write patched config.json (sandbox-specific socket paths updated).
+        // 1. For full-checkpoint snapshots, copy disk images to the new sandbox directory
+        //    before CH opens the files via config.json.
+        if !src.disk_images.is_empty() {
+            for entry in &src.disk_images {
+                let src_img = src.snapshot_dir.join(&entry.filename);
+                let dst_img = std::path::PathBuf::from(&self.base_dir)
+                    .join(format!("{}.img", entry.storage_id));
+                copy_img_file(&src_img, &dst_img).await.map_err(|e| {
+                    anyhow!("restore {}: copy disk {}: {}", self.id, entry.storage_id, e)
+                })?;
+            }
+            info!(
+                "restore {}: {} disk image(s) copied in {}ms",
+                self.id,
+                src.disk_images.len(),
+                t0.elapsed().as_millis()
+            );
+        }
+
+        // Build remap list: (CH device_id → absolute path in new sandbox dir).
+        let disk_remaps: Vec<(String, String)> = src
+            .disk_images
+            .iter()
+            .map(|e| {
+                let new_path = format!("{}/{}.img", self.base_dir, e.storage_id);
+                (e.device_id.clone(), new_path)
+            })
+            .collect();
+
+        // 2. Write patched config.json (sandbox-specific socket paths updated,
+        //    disk paths remapped or stripped depending on mode).
         patch_snapshot_config(
             &src.snapshot_dir.join("config.json"),
             &src.work_dir.join("config.json"),
             &src.overrides,
+            &disk_remaps,
         )
         .await?;
 
@@ -609,6 +673,57 @@ impl Snapshottable for CloudHypervisorVM {
 
         Ok(())
     }
+}
+
+// Copy disk images into the snapshot's `disks/` subdirectory while the VM is paused.
+// Returns a `DiskImageEntry` per disk on success, or an error if any copy fails.
+// Created as a separate function so `snapshot()` can resume the VM before returning the error.
+async fn copy_disk_images(
+    disks: &[DiskSnapshot],
+    dest_dir: &std::path::Path,
+    disks_dir: &std::path::Path,
+) -> containerd_sandbox::error::Result<Vec<DiskImageEntry>> {
+    tokio::fs::create_dir_all(disks_dir)
+        .await
+        .map_err(|e| anyhow!("create disks dir: {}", e))?;
+
+    let mut entries = Vec::with_capacity(disks.len());
+    for disk in disks {
+        let filename = format!("disks/{}.img", disk.storage_id);
+        let dst = dest_dir.join(&filename);
+        copy_img_file(std::path::Path::new(&disk.img_path), &dst)
+            .await
+            .map_err(|e| anyhow!("copy {}: {}", disk.storage_id, e))?;
+        entries.push(DiskImageEntry {
+            storage_id: disk.storage_id.clone(),
+            device_id: disk.device_id.clone(),
+            filename,
+        });
+    }
+    Ok(entries)
+}
+
+// Copy a file, attempting CoW reflink first for near-zero cost on btrfs/XFS,
+// falling back to a standard byte copy on filesystems that do not support it.
+async fn copy_img_file(
+    src: &std::path::Path,
+    dst: &std::path::Path,
+) -> containerd_sandbox::error::Result<()> {
+    let src_s = src.to_string_lossy().to_string();
+    let dst_s = dst.to_string_lossy().to_string();
+    let reflink_ok = tokio::process::Command::new("cp")
+        .args(["--reflink=auto", &src_s, &dst_s])
+        .status()
+        .await
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if reflink_ok {
+        return Ok(());
+    }
+    tokio::fs::copy(src, dst)
+        .await
+        .map(|_| ())
+        .map_err(|e| anyhow!("copy {:?} -> {:?}: {}", src, dst, e).into())
 }
 
 // Verify that host tools required for virtio-blk container layer preparation are available.
@@ -710,10 +825,10 @@ mod snapshot_tests {
             .expect("template VM cold start failed");
         eprintln!("cold start: {}ms", t_cold.elapsed().as_millis());
 
-        // snapshot
+        // snapshot (bare-VM, no disk images)
         let snapshot_dir = tmp.path().join("snapshot");
         let meta = tmpl_vm
-            .snapshot(&snapshot_dir)
+            .snapshot(&snapshot_dir, &[])
             .await
             .expect("snapshot failed");
         eprintln!("snapshot: {:?}", meta);
@@ -736,6 +851,8 @@ mod snapshot_tests {
                 task_vsock: restore_vsock,
                 console_path: "/tmp/restore-task.log".to_string(),
             },
+            ns_preinitialized: false,
+            disk_images: vec![],
         };
 
         let t_restore = Instant::now();

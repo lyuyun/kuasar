@@ -76,8 +76,8 @@ use crate::{
     template::{CreateTemplateRequest, PooledTemplate, TemplateKey, TemplateMetrics, TemplatePool},
     utils::{get_dns_config, get_hostname, get_resources, get_sandbox_cgroup_parent_path},
     vm::{
-        Hooks, Recoverable, RestoreSource, SnapshotMeta, SnapshotPathOverrides, Snapshottable,
-        VMFactory, VM,
+        DiskImageEntry, Hooks, Recoverable, RestoreSource, SnapshotMeta, SnapshotPathOverrides,
+        Snapshottable, VMFactory, VM,
     },
 };
 
@@ -440,6 +440,10 @@ where
     /// that value, so the new sandbox must start its counter there to avoid
     /// `IdentifierNotUnique` errors when hotplugging further devices.  Pass `0` when
     /// restoring from a snapshot taken from a bare (container-free) VM.
+    ///
+    /// `disk_images` lists the disk files that were captured during the snapshot.  Pass an
+    /// empty slice for bare-VM (template) snapshots; pass the entries from `PooledTemplate`
+    /// for full-checkpoint restores so the `.img` files are copied and remapped.
     pub async fn start_from_snapshot(
         &self,
         id: &str,
@@ -447,6 +451,7 @@ where
         template_id: Option<String>,
         ns_preinitialized: bool,
         template_id_generator: u32,
+        disk_images: Vec<DiskImageEntry>,
     ) -> Result<()> {
         let sandbox_mutex = self
             .sandboxes
@@ -473,6 +478,7 @@ where
                 console_path: format!("/tmp/{}-task.log", sandbox.id),
             },
             ns_preinitialized,
+            disk_images,
         };
 
         if let Err(e) = sandbox.start_from_snapshot(src).await {
@@ -1377,7 +1383,7 @@ where
 
     let snap_start = Instant::now();
     let meta: SnapshotMeta = vm
-        .snapshot(&snapshot_dir)
+        .snapshot(&snapshot_dir, &[])
         .await
         .map_err(|e| anyhow!("template {}: snapshot failed: {}", req.id, e))?;
     info!(
@@ -1506,7 +1512,7 @@ where
 
     let snap_start = Instant::now();
     let meta: SnapshotMeta = vm
-        .snapshot(&snapshot_dir)
+        .snapshot(&snapshot_dir, &[])
         .await
         .map_err(|e| anyhow!("template {}: snapshot failed: {}", req.id, e))?;
     info!(
@@ -1746,6 +1752,7 @@ where
                         Some(template_id.clone()),
                         tmpl.ns_preinitialized,
                         tmpl.id_generator,
+                        tmpl.disk_images.clone(),
                     )
                     .await
                 {

@@ -29,7 +29,7 @@ use containerd_sandbox::error::Result;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
-use crate::utils::write_file_atomic;
+use crate::{utils::write_file_atomic, vm::DiskImageEntry};
 
 /// Identifies a class of templates that share the same VM configuration.
 /// Two sandboxes with the same TemplateKey can be started from the same pool.
@@ -77,6 +77,12 @@ pub struct PooledTemplate {
     /// IDs already present in the restored VM state.
     #[serde(default)]
     pub id_generator: u32,
+    /// Disk images captured in this snapshot (full-checkpoint mode).
+    /// Empty for bare-VM templates; non-empty when snapshotted from a running sandbox with
+    /// active virtio-blk container layers.  Restored sandboxes copy these files into their
+    /// sandbox directory and CH remaps the backing paths via the patched config.json.
+    #[serde(default)]
+    pub disk_images: Vec<DiskImageEntry>,
 }
 
 impl PooledTemplate {
@@ -127,6 +133,7 @@ impl PooledTemplate {
             original_console_path: original_console_path.into(),
             ns_preinitialized: false,
             id_generator: 0,
+            disk_images: vec![],
         }
     }
 }
