@@ -73,12 +73,23 @@ impl SandboxResources {
 
     pub async fn add_storage(&mut self, container_id: &str, mut storage: Storage) -> Result<()> {
         for s in &mut self.storages {
-            if s.host_source == storage.host_source && s.r#type == storage.r#type {
+            // Dedup: same underlying source, type, AND mount destination — truly the same storage.
+            // mount_point must also match: in blk mode every container gets its own .img and its
+            // own mount_point even when sharing the same host overlay source, so deduping solely
+            // on host_source+type would suppress the mount for the new container's path.
+            if s.host_source == storage.host_source
+                && s.r#type == storage.r#type
+                && s.mount_point == storage.mount_point
+            {
                 warn!(
                     "add_storage dedup hit for container {}: \
                      existing id={} mp={}, incoming id={} mp={} src={}",
-                    container_id, s.id, s.mount_point,
-                    storage.id, storage.mount_point, storage.source
+                    container_id,
+                    s.id,
+                    s.mount_point,
+                    storage.id,
+                    storage.mount_point,
+                    storage.source
                 );
                 s.refer(container_id);
                 return Ok(());
