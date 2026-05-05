@@ -124,6 +124,18 @@ impl ContainerFactory<KuasarContainer> for KuasarFactory {
         } else {
             read_storages(&bundle, req.id()).await?
         };
+        warn!(
+            "create {}: {} storages to process: {:?}",
+            req.id(),
+            storages.len(),
+            storages
+                .iter()
+                .map(|s| format!(
+                    "id={} driver={} src={} mp={}",
+                    s.id, s.driver, s.source, s.mount_point
+                ))
+                .collect::<Vec<_>>()
+        );
         self.sandbox
             .lock()
             .await

@@ -74,6 +74,12 @@ impl SandboxResources {
     pub async fn add_storage(&mut self, container_id: &str, mut storage: Storage) -> Result<()> {
         for s in &mut self.storages {
             if s.host_source == storage.host_source && s.r#type == storage.r#type {
+                warn!(
+                    "add_storage dedup hit for container {}: \
+                     existing id={} mp={}, incoming id={} mp={} src={}",
+                    container_id, s.id, s.mount_point,
+                    storage.id, storage.mount_point, storage.source
+                );
                 s.refer(container_id);
                 return Ok(());
             }
@@ -131,12 +137,23 @@ impl SandboxResources {
     }
 
     async fn handle_blk_storage(&mut self, storage: &mut Storage) -> Result<()> {
-        // Retrieve the device path from pci address.
+        warn!(
+            "handle_blk_storage: waiting for blk device at pci={} id={} mp={}",
+            storage.source, storage.id, storage.mount_point
+        );
         let device = self.get_device(&storage.source, DeviceType::Blk).await?;
         let path = device.path.to_string();
+        warn!(
+            "handle_blk_storage: found device path={} for pci={}, mounting to {}",
+            path, storage.source, storage.mount_point
+        );
         storage.source = path;
 
         mount_storage(storage).await?;
+        warn!(
+            "handle_blk_storage: mounted id={} at {}",
+            storage.id, storage.mount_point
+        );
         Ok(())
     }
 
@@ -169,10 +186,21 @@ async fn mount_storage(storage: &Storage) -> Result<()> {
             ))?;
     }
 
-    debug!("mounting storage {:?}", storage);
+    warn!(
+        "mount_storage: fstype={} src={} opts={:?} mp={}",
+        storage.fstype, storage.source, storage.options, storage.mount_point
+    );
     let fstype = storage.fstype.as_str().none_if(|x| x.is_empty());
     let source = storage.source.as_str().none_if(|x| x.is_empty());
-    mount(fstype, source, &storage.options, &storage.mount_point).map_err(other_error!(e, ""))?;
+    let mount_result =
+        mount(fstype, source, &storage.options, &storage.mount_point).map_err(other_error!(e, ""));
+    if let Err(ref e) = mount_result {
+        warn!(
+            "mount_storage FAILED: fstype={} src={} mp={} err={}",
+            storage.fstype, storage.source, storage.mount_point, e
+        );
+    }
+    mount_result?;
     Ok(())
 }
 
