@@ -167,7 +167,7 @@ impl CloudHypervisorConfig {
         let cpus = Cpus::new(vm_config.common.vcpus);
         let memory = Memory::new(
             (vm_config.common.memory_in_mb as u64) * 1024 * 1024,
-            true,
+            vm_config.sharefs_type() == "virtiofs",
             vm_config.hugepages,
         );
         let mut cmdline = format!(
