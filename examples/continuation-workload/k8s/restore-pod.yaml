@@ -1,0 +1,21 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: continuation-vllm-restore
+  annotations:
+    kuasar.io/snapshot-type: continuation
+    kuasar.io/pod-uid: "550e8400-e29b-41d4-a716-446655440000"
+    kuasar.io/workload-generation: "0"
+spec:
+  containers:
+    - name: app
+      image: example/continuation-vllm:latest
+      ports:
+        - containerPort: 8000
+      env:
+        - name: MODEL_NAME
+          value: llama3-simulated
+        - name: KUASAR_POD_UID
+          value: "550e8400-e29b-41d4-a716-446655440000"
+        - name: KUASAR_WORKLOAD_GENERATION
+          value: "0"
