@@ -1,0 +1,47 @@
+# WarmFork restore pod — creates a task instance from the template.
+#
+# Apply one of these for each task you want to run. The sandboxer will:
+#   1. Look up the template by kuasar.io/template-key.
+#   2. CoW-copy the template memory into a new VM.
+#   3. Call reseed_guest_entropy() to give each instance unique PRNG state.
+#   4. Connect to the inject socket and run the WarmFork v1 protocol:
+#        injection mode: read CAPABILITIES → send PREPARE → read READY → send COMMIT → read STARTED
+#        autonomous mode: read CAPABILITIES → send COMMIT → read STARTED
+#   5. Injection mode: the workload receives task_id/context in PREPARE, then serves.
+#      Autonomous mode: the workload self-starts after COMMIT.
+#
+# Restore pods should declare the same snapshot type as the snapshot pod.
+# The runtime uses the restore pod annotations to select the WarmFork path.
+#
+# Required annotations:
+#   kuasar.io/snapshot-type   must be "warm-fork"
+#   kuasar.io/task-id         optional; non-empty = injection mode, omitted = autonomous mode
+#
+# Optional annotations:
+#   kuasar.io/task-context          opaque string passed in PREPARE.context
+#   kuasar.io/task-env/<NAME>       sets PREPARE.env_overrides[NAME]
+#
+# This example is single-container only. Do not set
+# kuasar.io/warm-fork-containers; omitting it selects single-container mode.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: warmfork-task-0001
+  annotations:
+    # Tell the sandboxer this is a WarmFork restore pod.
+    kuasar.io/snapshot-type: "warm-fork"
+    # Reference the snapshot created by snapshot-pod.yaml.
+    kuasar.io/template-key: "llm-server-v1"
+    # Optional task identifier. Omit this line for autonomous mode.
+    kuasar.io/task-id: "req-0001"
+    # Optional: opaque context for the workload (e.g. serialised request body).
+    kuasar.io/task-context: '{"user":"alice","prompt":"Explain quantum computing"}'
+    # Optional: per-task environment overrides.
+    kuasar.io/task-env/LOG_LEVEL: "debug"
+    kuasar.io/task-env/MAX_TOKENS: "512"
+spec:
+  runtimeClassName: kuasar-vmm
+  restartPolicy: Never
+  containers:
+    - name: inference
+      image: example/llm-server:latest  # same image as snapshot pod
