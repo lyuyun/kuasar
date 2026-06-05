@@ -1,0 +1,37 @@
+# WarmFork snapshot pod — a running workload that will later be snapshotted.
+#
+# Apply this pod to start and warm up the workload. After it reaches the
+# ready-waiting state, create the template from the running sandbox.
+#
+# Required annotations:
+#   kuasar.io/warm-fork-ready-protocol-version must be "1"
+#
+# Optional annotations:
+#   kuasar.io/warm-fork-readiness-socket override the default readiness socket path
+#
+# This example is single-container only. Do not set
+# kuasar.io/warm-fork-containers; omitting it selects single-container mode.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: warmfork-snapshot
+  annotations:
+    # Workload declaration: "I comply with the Snapshot Quiescent Contract."
+    # The sandboxer will not snapshot until it can connect to the readiness socket
+    # and read a CAPABILITIES message with protocol_version "1".
+    kuasar.io/warm-fork-ready-protocol-version: "1"
+    # Optional: override the default readiness socket path.
+    # kuasar.io/warm-fork-readiness-socket: "/run/my-warmfork-readiness.sock"
+spec:
+  runtimeClassName: kuasar-vmm   # use the Kuasar VMM runtime
+  restartPolicy: Never
+  containers:
+    - name: inference
+      image: example/llm-server:latest
+      env:
+        - name: MODEL_NAME
+          value: "llama-3-8b"
+        # WARMFORK_READINESS_SOCKET must match kuasar.io/warm-fork-readiness-socket annotation.
+        # Omit both to use the default /run/warmfork-readiness.sock.
+        # - name: WARMFORK_READINESS_SOCKET
+        #   value: "/run/my-warmfork-readiness.sock"
