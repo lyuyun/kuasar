@@ -20,7 +20,7 @@ limitations under the License.
 //!   - `SandboxController`         — sandbox instance lifecycle (pause/resume/list/get)
 //!   - `SandboxSnapshotController` — snapshot artifact lifecycle + plugin introspection (SSI)
 
-use std::sync::Arc;
+use std::{os::unix::fs::PermissionsExt, sync::Arc};
 
 use containerd_sandbox::SandboxStatus;
 use log::{info, warn};
@@ -289,8 +289,9 @@ where
             .ok_or_else(|| Status::not_found(format!("sandbox {} not found", req.sandbox_id)))?;
         let sb = mtx.lock().await;
         let snapshot_mode = match sb.restore.template_snapshot_type.as_ref() {
+            Some(SnapshotType::WarmFork) => SnapshotMode::WarmFork as i32,
             Some(SnapshotType::Continuation) => SnapshotMode::Continuation as i32,
-            _ => SnapshotMode::WarmFork as i32,
+            _ => SnapshotMode::Unspecified as i32,
         };
         let created_at_secs = sb
             .data
@@ -364,10 +365,14 @@ where
         if req.pod_uid.is_empty() {
             return Err(Status::invalid_argument("pod_uid is required"));
         }
-        if req.snapshot_name.contains('/') {
-            return Err(Status::invalid_argument(
-                "snapshot_name must not contain '/'; that separator is reserved for auto-generated continuation keys",
-            ));
+        {
+            let n = &req.snapshot_name;
+            let has_traversal = n.contains('/') || n.split('/').any(|c| c == ".." || c == ".");
+            if has_traversal {
+                return Err(Status::invalid_argument(
+                    "snapshot_name must not contain path traversal components ('/', '..', '.')",
+                ));
+            }
         }
 
         let sandbox_id = find_sandbox_id_by_pod_uid(&handle.inner, &req.pod_uid)
@@ -383,11 +388,12 @@ where
         let snap_type = snapshot_type(mode);
 
         let workload_identity = if matches!(snap_type, SnapshotType::Continuation) {
-            let generation = req
-                .parameters
-                .get("generation")
-                .and_then(|g| g.parse::<u64>().ok())
-                .unwrap_or(0);
+            let generation = match req.parameters.get("generation") {
+                None => 0u64,
+                Some(g) => g.parse::<u64>().map_err(|_| {
+                    Status::invalid_argument(format!("invalid generation parameter: {:?}", g))
+                })?,
+            };
             Some(WorkloadIdentity {
                 pod_uid: req.pod_uid.clone(),
                 generation,
@@ -423,7 +429,7 @@ where
         .map_err(grpc_err)?;
 
         Ok(Response::new(CreateSandboxSnapshotResponse {
-            snapshot: Some(template_to_proto(&tmpl, &req.snapshot_name, &req.pod_uid)),
+            snapshot: Some(template_to_proto(&tmpl, &key, &req.pod_uid)),
         }))
     }
 
@@ -445,7 +451,9 @@ where
                 .into_iter()
                 .find(|t| t.key.key == req.snapshot_name);
             if let Some(tmpl) = found {
-                let _ = pool.remove_by_id(&tmpl.id, &SnapshotType::WarmFork).await;
+                pool.remove_by_id(&tmpl.id, &SnapshotType::WarmFork)
+                    .await
+                    .map_err(grpc_err)?;
             }
         }
         if let Some(cs) = &handle.inner.continuation_store {
@@ -455,7 +463,7 @@ where
                 .into_iter()
                 .find(|t| t.key.key == req.snapshot_name);
             if let Some(tmpl) = found {
-                let _ = cs.delete_by_template_id(&tmpl.id).await;
+                cs.delete_by_template_id(&tmpl.id).await.map_err(grpc_err)?;
             }
         }
 
@@ -566,6 +574,7 @@ where
     let _ = std::fs::remove_file(sock_path);
 
     let uds = UnixListener::bind(sock_path)?;
+    std::fs::set_permissions(sock_path, std::fs::Permissions::from_mode(0o600))?;
     let uds_stream = UnixListenerStream::new(uds);
 
     let wrapper = GrpcHandleWrapper(handle);

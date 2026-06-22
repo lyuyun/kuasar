@@ -197,6 +197,11 @@ where
     }
 
     handle.sandboxes.write().await.remove(sandbox_id);
+    handle
+        .pod_uid_index
+        .write()
+        .await
+        .retain(|_, sid| sid != sandbox_id);
     info!("service:destroyed sandbox {}", sandbox_id);
     Ok(())
 }

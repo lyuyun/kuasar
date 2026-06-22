@@ -244,7 +244,7 @@ where
             anyhow!("continuation store not configured (enable_continuation_restore=true required)")
         })?;
         let dir = store.entry_dir_by_key(key).join("snapshot");
-        if dir.exists() {
+        if tokio::fs::try_exists(&dir).await.unwrap_or(false) {
             return Err(anyhow!(
                 "continuation snapshot for key='{}' already exists at {}; \
                  remove it before re-snapshotting",

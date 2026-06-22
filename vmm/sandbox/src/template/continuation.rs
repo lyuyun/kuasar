@@ -171,6 +171,16 @@ impl ContinuationStore {
             return None;
         }
 
+        if tmpl.key.key != key {
+            log::error!(
+                "continuation store: key mismatch: requested={}, metadata contains={}; \
+                 directory may be corrupted or misplaced",
+                key,
+                tmpl.key.key,
+            );
+            return None;
+        }
+
         if let Err(e) = write_consumed_marker(&marker).await {
             log::error!(
                 "continuation store: failed to write consumed marker for key={}: {}",
@@ -227,7 +237,11 @@ impl ContinuationStore {
                 };
                 while let Ok(Some(sub_entry)) = sub.next_entry().await {
                     let sub_path = sub_entry.path();
-                    if sub_path.is_dir() {
+                    if sub_path.is_dir()
+                        && tokio::fs::try_exists(sub_path.join("pooled_template.json"))
+                            .await
+                            .unwrap_or(false)
+                    {
                         result.push(sub_path);
                     }
                 }
@@ -270,7 +284,14 @@ impl ContinuationStore {
             Ok(()) => {
                 log::info!("continuation store: deleted key={}", key);
                 // Best-effort: remove the empty pod-UID parent left by the two-level layout.
-                let _ = tokio::fs::remove_dir(dir.parent().unwrap_or(&self.store_dir)).await;
+                // Guard: only attempt removal when the parent is strictly inside store_dir
+                // (i.e. two-level key). For one-level keys dir.parent() equals store_dir
+                // itself, and we must never try to delete the store root.
+                if let Some(parent) = dir.parent() {
+                    if parent != self.store_dir.as_path() {
+                        let _ = tokio::fs::remove_dir(parent).await;
+                    }
+                }
                 Ok(true)
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),

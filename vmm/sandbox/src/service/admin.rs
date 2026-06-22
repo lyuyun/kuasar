@@ -46,9 +46,8 @@ limitations under the License.
 //!
 //! ### pool-gc — remove a single template from the pool by ID
 //! ```json
-//! {"action":"pool-gc","kind":"environment","template_id":"<id>"}
+//! {"action":"pool-gc","template_id":"<id>"}
 //! ```
-//! - `kind`          `"environment"` or `"warm_fork"` (required, safety cross-check)
 //! - `template_id`   ID of the template to remove (required)
 //!
 //! ## Response envelope
@@ -359,12 +358,6 @@ where
         .as_ref()
         .ok_or_else(|| anyhow!("template pool not configured"))?;
 
-    let kind_str = match req["kind"].as_str() {
-        Some(k) => k.to_string(),
-        None => {
-            return Ok(json!({"ok": false, "error": "missing required field 'kind'"}));
-        }
-    };
     let template_id = match req["template_id"].as_str() {
         Some(id) => id.to_string(),
         None => {
@@ -372,16 +365,17 @@ where
         }
     };
 
-    let expected_kind = SnapshotType::Environment;
-
-    match pool.remove_by_id(&template_id, &expected_kind).await {
+    match pool
+        .remove_by_id(&template_id, &SnapshotType::Environment)
+        .await
+    {
         Err(e) => Ok(json!({"ok": false, "error": e.to_string()})),
         Ok(false) => {
             Ok(json!({"ok": false, "error": format!("template {} not found in pool", template_id)}))
         }
         Ok(true) => {
             let remaining = pool.total_depth().await;
-            Ok(json!({"ok": true, "kind": kind_str, "removed": 1, "remaining": remaining}))
+            Ok(json!({"ok": true, "removed": 1, "remaining": remaining}))
         }
     }
 }

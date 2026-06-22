@@ -44,8 +44,8 @@ impl SandboxApi {
         Ok(SandboxControllerClient::new(channel))
     }
 
-    /// Pause the VM vCPUs of a running sandbox.
-    /// The CH process stays alive; network (tap, TC rules) is untouched.
+    /// Checkpoint a running sandbox to disk and stop the CH process.
+    /// Network state (tap, TC rules) is preserved; call [`Self::resume`] to restore.
     pub async fn pause(&self, sandbox_id: &str) -> Result<()> {
         self.connect()
             .await?

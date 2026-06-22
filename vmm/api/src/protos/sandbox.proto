@@ -16,8 +16,8 @@ enum SnapshotMode {
     CONTINUATION = 2;
 }
 
-// PauseSandbox: pause the VM vCPUs of a running sandbox.
-// The CH process stays alive; the sandbox netns, tap, and TC rules are untouched.
+// PauseSandbox: checkpoint a running sandbox to disk and stop the CH process.
+// The sandbox netns, tap, and TC rules are preserved; use ResumeSandbox to restore.
 message PauseSandboxRequest   { string sandbox_id = 1; }
 message PauseSandboxResponse  {}
 

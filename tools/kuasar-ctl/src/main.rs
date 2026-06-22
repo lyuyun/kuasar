@@ -188,8 +188,8 @@ enum SnapshotAction {
 
 #[derive(clap::Subcommand)]
 enum SandboxAction {
-    /// Pause the VM vCPUs of a running sandbox.
-    /// The CH process stays alive; network (tap, TC rules, netns) is untouched.
+    /// Checkpoint a running sandbox to disk and stop the CH process.
+    /// Network state (tap, TC rules, netns) is preserved; use 'resume' to restore.
     Pause {
         #[arg(long, default_value = DEFAULT_GRPC_SOCK)]
         grpc_sock: PathBuf,
@@ -252,6 +252,10 @@ async fn run() -> Result<i32> {
                     generation,
                 },
         } => {
+            if mode == "warm_fork" && name.is_none() {
+                eprintln!("error: --name is required for warm_fork mode");
+                return Ok(1);
+            }
             let info = SnapshotApi::new(&grpc_sock)
                 .create(name.as_deref().unwrap_or(""), &pod_uid, &mode, generation)
                 .await?;
